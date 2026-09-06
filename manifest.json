@@ -1,0 +1,11 @@
+{
+  "id": "yugioh-deck-checklist-plugin",
+  "name": "Yu-Gi-Oh Deck CheckList Plugin",
+  "version": "0.1.0",
+  "minAppVersion": "1.14.0",
+  "description": "Visual deck builder with banlist check, hand trap detection, and craft cost calculator.",
+  "author": "Rahul",
+  "authorUrl": "",
+  "isDesktopOnly": false,
+  "main": "main.js"
+}
