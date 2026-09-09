@@ -11,18 +11,27 @@ const HAND_TRAPS = [
 // file is missing or fails to parse.
 const MD_RARITY_FALLBACK = {};
 
-// Master Duel Forbidden/Limited/Semi-Limited status. Ships as md-banlist.json
-// (community-sourced snapshot — see its _meta.source/asOf) and is loaded the
-// same way. Falls back to "everything Unlimited" if the file can't be read.
-const MD_BANLIST_FALLBACK = {};
-
 // Copy limit implied by a Master Duel banlist status.
 const BANLIST_COPY_LIMIT = {
     'Forbidden': 0, 'Limited 1': 1, 'Limited 2': 2, 'Unlimited': 3
 };
 
-// If the banlist snapshot's _meta.asOf date is older than this, the plugin
-// nags (once per Obsidian session) to run the Update Banlist command.
+// The auto-fetched banlist (see YugiohPlugin.fetchLatestBanlist) is keyed by
+// Konami ID with a raw copies-allowed value (0/1/2) rather than a status
+// string — this converts one to the other.
+const BANLIST_VALUE_TO_STATUS = { 0: 'Forbidden', 1: 'Limited 1', 2: 'Limited 2' };
+
+// Community-maintained, auto-updating (daily) Master Duel limit-regulation
+// feed from the YAML Yugi project — see
+// https://github.com/DawnbrandBots/yaml-yugi-limit-regulation. Keyed by
+// Konami ID, not card name, so no name-resolution step is needed: we just
+// cross-reference each fetched card's own konami_id (already returned by
+// YGOPRODeck's misc=yes) against this.
+const BANLIST_SOURCE_URL = 'https://dawnbrandbots.github.io/yaml-yugi-limit-regulation/master-duel/current.vector.json';
+
+// If the plugin hasn't been able to refresh the banlist (e.g. no internet)
+// for this many days, checkBanlistFreshness() surfaces a Notice so a long
+// offline stretch doesn't go unnoticed.
 const BANLIST_STALE_DAYS = 30;
 
 const DEFAULT_SETTINGS = {};
@@ -690,13 +699,88 @@ class YugiohPlugin extends Plugin {
         });
         this.addCommand({
             id: 'update-banlist',
-            name: '🔄 Update Banlist (paste latest)',
-            callback: () => new UpdateBanlistModal(this.app, this).open()
+            name: '🔄 Check for Master Duel Banlist Update',
+            callback: () => this.updateBanlistFromSource(true)
         });
-        // One nag per Obsidian launch if the banlist snapshot is stale —
-        // there's no stable public API for the Master Duel banlist to poll,
-        // so this is what stands in for an automatic monthly check.
+        // Auto-refresh the Master Duel banlist in the background on every
+        // launch. It's one small request to a daily-updated community feed
+        // (see fetchLatestBanlist) — no manual monthly update needed. If
+        // it's offline or the source is down, this fails silently and keeps
+        // whatever was last cached; checkBanlistFreshness() below is the
+        // backstop that surfaces a Notice if that drags on too long.
+        this.autoUpdateBanlist();
         this.checkBanlistFreshness();
+    }
+
+    // Fetches the current Master Duel limit regulation vector. Returns
+    // { ok: true, date, regulation } on success, or { ok: false, error }
+    // — never throws, since this runs unattended on every launch.
+    async fetchLatestBanlist() {
+        try {
+            const res = await fetch(BANLIST_SOURCE_URL);
+            if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+            const data = await res.json();
+            if (!data || typeof data.regulation !== 'object' || !data.date) {
+                return { ok: false, error: 'Unexpected response shape' };
+            }
+            return { ok: true, date: data.date, regulation: data.regulation };
+        } catch (err) {
+            return { ok: false, error: err.message };
+        }
+    }
+
+    // Writes a freshly-fetched regulation vector to md-banlist.json and
+    // reloads it live.
+    async applyBanlistResult(result, notify) {
+        const fileContent = {
+            _meta: {
+                format: 'Master Duel',
+                asOf: result.date,
+                source: BANLIST_SOURCE_URL,
+                note: 'Auto-fetched from the YAML Yugi limit-regulation project (community-maintained, updated daily: https://github.com/DawnbrandBots/yaml-yugi-limit-regulation). Keyed by Konami ID; value is copies allowed per deck (0=Forbidden, 1=Limited, 2=Semi-Limited).'
+            },
+            regulation: result.regulation
+        };
+        const success = await this.writeDataFile('md-banlist.json', JSON.stringify(fileContent, null, 4));
+        if (!success) {
+            if (notify) new Notice('❌ Failed to write md-banlist.json.');
+            return false;
+        }
+        await this.loadDataFiles(false);
+        return true;
+    }
+
+    // Shared by the silent auto-update and the manual "Check for Banlist
+    // Update" command (notify=true shows a Notice either way, including
+    // "already current").
+    async updateBanlistFromSource(notify = false) {
+        const result = await this.fetchLatestBanlist();
+        if (!result.ok) {
+            if (notify) new Notice(`❌ Couldn't fetch the latest banlist: ${result.error}`);
+            return false;
+        }
+        if (notify && this.banlistMeta?.asOf === result.date) {
+            new Notice(`✅ Banlist already current (dated ${result.date}).`);
+            return true;
+        }
+        const success = await this.applyBanlistResult(result, notify);
+        if (success && notify) {
+            new Notice(`✅ Banlist updated — ${Object.keys(result.regulation).length} entries, dated ${result.date}.`);
+        }
+        return success;
+    }
+
+    // Silent background version run on every launch: only writes/reloads
+    // when the fetched date is actually new, and never shows a Notice for
+    // "already current" or "offline" — those are the common case, not
+    // something worth interrupting the user for.
+    async autoUpdateBanlist() {
+        const result = await this.fetchLatestBanlist();
+        if (!result.ok || this.banlistMeta?.asOf === result.date) return;
+        const updated = await this.applyBanlistResult(result, false);
+        if (updated) {
+            new Notice(`🔄 Master Duel banlist auto-updated to ${result.date}.`);
+        }
     }
 
     // Reads md-rarities.json and md-banlist.json from the plugin's own folder
@@ -706,11 +790,11 @@ class YugiohPlugin extends Plugin {
     // than a load failure, so the plugin still works out of the box.
     async loadDataFiles(notify = false) {
         this.rarityDB = await this.readJsonFile('md-rarities.json', MD_RARITY_FALLBACK);
-        const banlistFile = await this.readJsonFile('md-banlist.json', { cards: MD_BANLIST_FALLBACK });
-        this.banlistDB = banlistFile.cards || banlistFile; // tolerate a bare {name: status} file too
+        const banlistFile = await this.readJsonFile('md-banlist.json', { regulation: {} });
+        this.banlistRegulation = banlistFile.regulation || {};
         this.banlistMeta = banlistFile._meta || null;
         if (notify) {
-            const n = Object.keys(this.rarityDB).length, b = Object.keys(this.banlistDB).length;
+            const n = Object.keys(this.rarityDB).length, b = Object.keys(this.banlistRegulation).length;
             new Notice(`🔄 Reloaded data: ${n} rarities, ${b} banlist entries`);
         }
     }
@@ -750,23 +834,27 @@ class YugiohPlugin extends Plugin {
         return Math.floor((Date.now() - then.getTime()) / (1000 * 60 * 60 * 24));
     }
 
-    // Nags once per launch if the banlist snapshot is older than
-    // BANLIST_STALE_DAYS. Master Duel's banlist isn't exposed via any
-    // stable public API, so this is a reminder to run "🔄 Update Banlist"
-    // and paste in the latest list rather than an automatic fetch.
+    // Nags if the banlist snapshot is older than BANLIST_STALE_DAYS —
+    // autoUpdateBanlist() runs every launch, so this only fires when that
+    // has been silently failing (e.g. no internet, or the source is down)
+    // for a while, as a backstop so a long stale stretch doesn't go unnoticed.
     checkBanlistFreshness() {
         const days = this.getBanlistAgeDays();
         if (days === null || days < BANLIST_STALE_DAYS) return;
         new Notice(
-            `⚠️ Master Duel banlist is ${days} days old (dated ${this.banlistMeta.asOf}). Run "🔄 Update Banlist" to refresh it.`,
+            `⚠️ Master Duel banlist is ${days} days old (dated ${this.banlistMeta.asOf}) and couldn't auto-update. Check your connection, or run "🔄 Check for Master Duel Banlist Update".`,
             10000
         );
     }
 
-    // Master Duel banlist status for a card, defaulting to Unlimited for
-    // anything not present in md-banlist.json.
-    getBanStatusMD(name) {
-        return (this.banlistDB && this.banlistDB[name]) || 'Unlimited';
+    // Master Duel banlist status for a card, looked up by its own Konami
+    // ID (from misc_info.konami_id) against the auto-fetched regulation
+    // vector — no name-based lookup needed. Defaults to Unlimited when the
+    // ID is missing or not present in the vector.
+    getBanStatusMD(konamiId) {
+        if (konamiId === undefined || konamiId === null) return 'Unlimited';
+        const value = this.banlistRegulation?.[String(konamiId)];
+        return BANLIST_VALUE_TO_STATUS[value] ?? 'Unlimited';
     }
 
     async loadSettings() {
@@ -878,7 +966,8 @@ class YugiohPlugin extends Plugin {
                 desc: c.desc, image: c.card_images[0].image_url,
                 archetype: c.archetype,
                 ban_tcg: c.banlist_info?.ban_tcg || 'Unlimited',
-                ban_md: this.getBanStatusMD(c.name),
+                konami_id: c.misc_info?.[0]?.konami_id,
+                ban_md: this.getBanStatusMD(c.misc_info?.[0]?.konami_id),
                 rarity: this.rarityDB[c.name] || this.normalizeMdRarity(c.misc_info?.[0]?.md_rarity) || this.getRarity(c),
                 frameType: c.frameType
             };
@@ -937,7 +1026,8 @@ class YugiohPlugin extends Plugin {
                     desc: c.desc, image: c.card_images[0].image_url,
                     archetype: c.archetype,
                     ban_tcg: c.banlist_info?.ban_tcg || 'Unlimited',
-                    ban_md: this.getBanStatusMD(c.name),
+                    konami_id: c.misc_info?.[0]?.konami_id,
+                    ban_md: this.getBanStatusMD(c.misc_info?.[0]?.konami_id),
                     rarity: this.rarityDB[c.name] || this.normalizeMdRarity(c.misc_info?.[0]?.md_rarity) || this.getRarity(c),
                     frameType: c.frameType
                 }));
@@ -2031,7 +2121,7 @@ class DeckUI extends Modal {
 
         // Ban status (Master Duel — falls back to Unlimited for cards not in
         // md-banlist.json, which also covers cards fetched before that file existed)
-        const banStatus = card.ban_md || this.plugin.getBanStatusMD(card.name);
+        const banStatus = card.ban_md || this.plugin.getBanStatusMD(card.konami_id);
         if (banStatus && banStatus !== 'Unlimited') {
             const banEl = wrap.createEl('div');
             banEl.textContent = `⚠ MD: ${banStatus}`;
@@ -2163,12 +2253,13 @@ class DeckUI extends Modal {
             errors.push(`Extra Deck has ${extraCount} cards (max ${extraMax})`);
         }
 
-        const combined = new Map(); // name -> total copies across main+extra
+        const combined = new Map(); // name -> { total copies across main+extra, konami_id }
         for (const c of [...mainCards, ...extraCards]) {
-            combined.set(c.name, (combined.get(c.name) || 0) + (c.count || 1));
+            const prev = combined.get(c.name);
+            combined.set(c.name, { total: (prev?.total || 0) + (c.count || 1), konami_id: c.konami_id });
         }
-        for (const [name, total] of combined) {
-            const status = this.plugin.getBanStatusMD(name);
+        for (const [name, { total, konami_id }] of combined) {
+            const status = this.plugin.getBanStatusMD(konami_id);
             const limit = BANLIST_COPY_LIMIT[status] ?? 3;
             if (total > limit) {
                 errors.push(limit === 0
@@ -2287,111 +2378,6 @@ class DeckUI extends Modal {
     }
 }
 
-// Lets the user paste an updated Master Duel banlist and saves it to
-// md-banlist.json, stamping today's date as the new asOf. This is the
-// "monthly update" workflow: there's no stable public API for the Master
-// Duel banlist to poll, so rather than scraping a page that can silently
-// break, the user pastes the current Forbidden/Limited list (e.g. copied
-// from wargamer.com or the in-game banlist screen) and the plugin handles
-// the file format, validation, and live reload.
-class UpdateBanlistModal extends Modal {
-    constructor(app, plugin) {
-        super(app);
-        this.plugin = plugin;
-    }
-
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.style.cssText = 'font-family: monospace; font-size: 0.88em; color: #e2e8f0;';
-        this.titleEl.textContent = '🔄 Update Master Duel Banlist';
-
-        const meta = this.plugin.banlistMeta;
-        const ageDays = this.plugin.getBanlistAgeDays();
-        const statusLine = contentEl.createEl('p');
-        statusLine.style.cssText = 'color: #94a3b8; margin-bottom: 4px;';
-        statusLine.textContent = meta?.asOf
-            ? `Current snapshot dated ${meta.asOf}${ageDays !== null ? ` (${ageDays} days old)` : ''}.`
-            : 'No banlist metadata found yet.';
-
-        contentEl.createEl('p', {
-            text: 'Edit the JSON below — "Card Name": "Forbidden" | "Limited 1" | "Limited 2". Anything left out is treated as Unlimited. It\'s pre-filled with the current list, so just add/remove/change entries for what changed this month.'
-        }).style.cssText = 'color: #94a3b8; margin-bottom: 10px;';
-
-        const sourceRow = contentEl.createEl('div');
-        sourceRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 8px; align-items: center;';
-        sourceRow.createEl('label', { text: 'Source URL:' }).style.cssText = 'color: #cbd5e1; min-width: 90px;';
-        const sourceInput = sourceRow.createEl('input');
-        sourceInput.value = meta?.source || 'https://www.wargamer.com/yu-gi-oh-master-duel/banlist';
-        sourceInput.style.cssText = 'flex: 1; background: #1f2937; border: 1px solid #374151; border-radius: 5px; padding: 5px 8px; color: #e2e8f0; font-family: monospace; font-size: 0.9em;';
-
-        const dateRow = contentEl.createEl('div');
-        dateRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 10px; align-items: center;';
-        dateRow.createEl('label', { text: 'As of date:' }).style.cssText = 'color: #cbd5e1; min-width: 90px;';
-        const dateInput = dateRow.createEl('input');
-        dateInput.type = 'text';
-        dateInput.placeholder = 'YYYY-MM-DD';
-        dateInput.value = new Date().toISOString().slice(0, 10);
-        dateInput.style.cssText = 'background: #1f2937; border: 1px solid #374151; border-radius: 5px; padding: 5px 8px; color: #e2e8f0; font-family: monospace; font-size: 0.9em; width: 130px;';
-
-        const textarea = contentEl.createEl('textarea');
-        textarea.rows = 14;
-        textarea.style.cssText = `
-            width: 100%; background: #0d0f1a; border: 1px solid #374151;
-            border-radius: 6px; padding: 10px; color: #e2e8f0;
-            font-family: monospace; font-size: 0.82em; resize: vertical;
-        `;
-        textarea.placeholder = '{\n  "Card Name": "Forbidden",\n  "Another Card": "Limited 1"\n}';
-        textarea.value = JSON.stringify(this.plugin.banlistDB || {}, null, 4);
-
-        const btnRow = contentEl.createEl('div');
-        btnRow.style.cssText = 'display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px;';
-
-        const cancelBtn = btnRow.createEl('button', { text: 'Cancel' });
-        cancelBtn.style.cssText = 'background: #374151; color: #e2e8f0; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: monospace;';
-        cancelBtn.onclick = () => this.close();
-
-        const saveBtn = btnRow.createEl('button', { text: '💾 Save Banlist' });
-        saveBtn.style.cssText = 'background: #7c3aed; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: monospace; font-weight: bold;';
-        saveBtn.onclick = async () => {
-            let parsed;
-            try {
-                parsed = JSON.parse(textarea.value);
-            } catch (err) {
-                return new Notice(`❌ Invalid JSON: ${err.message}`);
-            }
-            if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
-                return new Notice('❌ Expected a flat object of "Card Name": "Status" pairs.');
-            }
-            const validStatuses = new Set(Object.keys(BANLIST_COPY_LIMIT));
-            const badEntry = Object.entries(parsed).find(([, status]) => !validStatuses.has(status));
-            if (badEntry) {
-                return new Notice(`❌ "${badEntry[0]}" has invalid status "${badEntry[1]}". Use Forbidden, Limited 1, Limited 2, or Unlimited.`);
-            }
-
-            const asOf = dateInput.value.trim() || new Date().toISOString().slice(0, 10);
-            const fileContent = {
-                _meta: {
-                    format: 'Master Duel',
-                    asOf,
-                    source: sourceInput.value.trim(),
-                    note: 'Community-sourced snapshot, not an official Konami feed. Updated via the plugin\'s Update Banlist command.'
-                },
-                cards: parsed
-            };
-
-            const success = await this.plugin.writeDataFile('md-banlist.json', JSON.stringify(fileContent, null, 4));
-            if (!success) {
-                return new Notice('❌ Failed to write md-banlist.json.');
-            }
-            await this.plugin.loadDataFiles(false);
-            new Notice(`✅ Banlist updated — ${Object.keys(parsed).length} entries, dated ${asOf}.`);
-            this.close();
-        };
-    }
-
-    onClose() { this.contentEl.empty(); }
-}
-
 class YugiohSettingTab extends PluginSettingTab {
     constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
 
@@ -2422,16 +2408,21 @@ class YugiohSettingTab extends PluginSettingTab {
         const ageDays = this.plugin.getBanlistAgeDays();
         containerEl.createEl('p', {
             text: meta?.asOf
-                ? `Current snapshot dated ${meta.asOf}${ageDays !== null ? ` (${ageDays} days old)` : ''}. There's no public API for the Master Duel banlist, so this stays a manual paste-in — update it monthly, or whenever a new banlist drops (the plugin will nag you at 30+ days).`
+                ? `Current snapshot dated ${meta.asOf}${ageDays !== null ? ` (${ageDays} days old)` : ''}. Auto-updates in the background on every launch from the YAML Yugi limit-regulation project (community-maintained, updated daily).`
                 : 'No banlist data loaded yet.'
         });
         new Setting(containerEl)
-            .setName('Update banlist')
-            .setDesc('Paste in the latest Forbidden/Limited list and save — updates md-banlist.json and reloads it immediately.')
+            .setName('Check for banlist update now')
+            .setDesc('Fetches the latest Master Duel limit regulation and reloads it immediately, without waiting for the next launch.')
             .addButton(btn => btn
-                .setButtonText('🔄 Update Banlist')
+                .setButtonText('🔄 Check Now')
                 .setCta()
-                .onClick(() => new UpdateBanlistModal(this.app, this.plugin).open())
+                .onClick(async () => {
+                    btn.setDisabled(true);
+                    await this.plugin.updateBanlistFromSource(true);
+                    btn.setDisabled(false);
+                    this.display();
+                })
             );
     }
 }
