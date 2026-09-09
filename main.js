@@ -5,20 +5,20 @@ const HAND_TRAPS = [
     'Nibiru, the Primal Being', 'Droll & Lock Bird', 'Ghost Ogre & Snow Rabbit'
 ];
 
-const MD_RARITY_DB = {
-    'Ash Blossom & Joyous Spring': 'UR', 'Maxx "C"': 'UR', 'Effect Veiler': 'SR',
-    'Nibiru, the Primal Being': 'UR', 'Elemental HERO Stratos': 'SR',
-    'Destiny HERO Malicious': 'SR', 'Chamber Dragonmaid': 'UR',
-    'Parlor Dragonmaid': 'SR', 'Dragonmaid Changeover': 'R',
-    'Dragonmaid Hospitality': 'SR', 'Dragonmaid Tidying': 'SR',
-    'Dragonmaid Sheou': 'UR', 'House Dragonmaid': 'SR', 'Dragonmaid Strahl': 'UR',
-    'Infinite Impermanence': 'UR', 'Called by the Grave': 'UR',
-    'That Grass Looks Greener': 'UR', 'Chaos Dragon Levianeer': 'UR',
-    'Bystial Magnamhut': 'UR', 'Bystial Druiswurm': 'SR',
-    'Accesscode Talker': 'UR', 'Mirrorjade the Iceblade Dragon': 'UR',
-    'Bystial Dis Pater': 'UR', 'A Hero Lives': 'UR', 'Book of Moon': 'R',
-    'Boot Sector Launch': 'SR', 'Chaos Space': 'SR',
-    'Compulsory Evacuation Device': 'R'
+// The rarity DB used to live here as a hardcoded object. It's now shipped as
+// md-rarities.json (loaded in Plugin.onload → loadDataFiles) so it can be
+// edited without touching code. This is the last-resort fallback if that
+// file is missing or fails to parse.
+const MD_RARITY_FALLBACK = {};
+
+// Master Duel Forbidden/Limited/Semi-Limited status. Ships as md-banlist.json
+// (community-sourced snapshot — see its _meta.source/asOf) and is loaded the
+// same way. Falls back to "everything Unlimited" if the file can't be read.
+const MD_BANLIST_FALLBACK = {};
+
+// Copy limit implied by a Master Duel banlist status.
+const BANLIST_COPY_LIMIT = {
+    'Forbidden': 0, 'Limited 1': 1, 'Limited 2': 2, 'Unlimited': 3
 };
 
 const DEFAULT_SETTINGS = {};
@@ -124,14 +124,26 @@ function explicitTypeGroup(heading) {
 function computeTypeGroups(lines) {
     const typeGroups = new Array(lines.length).fill(null);
     let currentType = null;
-    let currentDepth = 0;
+    // Infinity = "no bucket active" — lets the next heading, at ANY depth,
+    // take effect. Without this, a non-matching parent heading (e.g. "#
+    // MAIN DECK", which sets type=null) permanently locks currentDepth at
+    // its own level, so a deeper "## Monsters" heading nested under it is
+    // treated as "too deep to matter" and never gets to set the bucket —
+    // typeGroups ends up null for the whole file.
+    let currentDepth = Infinity;
     for (let i = 0; i < lines.length; i++) {
         const hm = lines[i].match(/^(#{1,6})\s+.*/);
         if (hm) {
             const depth = hm[1].length;
-            if (currentDepth === 0 || depth <= currentDepth) {
+            if (depth <= currentDepth) {
                 currentType = explicitTypeGroup(lines[i]);
-                currentDepth = depth;
+                // Only lock in this depth when a bucket was actually matched.
+                // Otherwise stay "open" so a deeper heading can still set it
+                // (fixes Monsters/Spells/Traps under a non-matching parent
+                // like "# MAIN DECK"), while a heading that DID match still
+                // correctly blocks deeper false-positives like "### Hand
+                // Traps" (nested under Monsters) from flipping to Trap.
+                currentDepth = currentType !== null ? depth : Infinity;
             }
             continue;
         }
@@ -347,8 +359,8 @@ function appendCardToSection(content, card) {
     const groupKey = ['main60', 'main40', 'extra'].includes(card.deckGroup) ? card.deckGroup : 'main60';
 
     const rarity = card.rarity || 'N';
-    const countPrefix = card.count && card.count > 1 ? `${card.count}x ` : '';
-    const newLine = `- [${card.owned ? 'x' : ' '}] ${countPrefix}${card.name} ×1 [${rarity}]`;
+    const count = card.count || 1;
+    const newLine = `- [${card.owned ? 'x' : ' '}] ${card.name} ×${count} [${rarity}]`;
 
     // Prefer inserting into the matching Monster/Spell/Trap subsection within
     // this deck group. Without this, a new card just gets appended after
@@ -405,6 +417,36 @@ function appendCardToSection(content, card) {
     };
     const trimmed = content.replace(/\s+$/, '');
     return `${trimmed}${eol}${eol}${HEADINGS[groupKey]}${eol}${newLine}${eol}`;
+}
+
+// Writes a card's current count to the template: rewrites the existing line
+// in place if one's already there for this card+section (so re-adding a card
+// bumps its ×N instead of creating a duplicate line), otherwise appends a new
+// one via appendCardToSection. This is the one place that turns "the user hit
+// Add" into a template change, so the note and the in-app count can't drift.
+function upsertCardInTemplate(content, card) {
+    const eol = detectEOL(content);
+    const lines = splitLines(content);
+    const groups = computeLineGroups(lines);
+    const groupKey = ['main60', 'main40', 'extra'].includes(card.deckGroup) ? card.deckGroup : 'main60';
+    const target = card.name.trim().toLowerCase();
+    const count = card.count || 1;
+    const rarity = card.rarity || 'N';
+
+    for (let i = 0; i < lines.length; i++) {
+        if (groups[i] !== groupKey) continue;
+        const m = lines[i].match(CARD_LINE_RE);
+        if (!m) continue;
+        const { name } = parseEntryText(m[2]);
+        if (name.toLowerCase() !== target) continue;
+
+        const checkbox = m[1];
+        const prefix = checkbox !== undefined ? `- ${checkbox} ` : '- ';
+        lines[i] = `${prefix}${card.name} ×${count} [${rarity}]`;
+        return lines.join(eol);
+    }
+
+    return appendCardToSection(content, card);
 }
 
 const DECK_TEMPLATE = `# 🐉 Deck Template – Master Duel (Obsidian)
@@ -572,6 +614,7 @@ Use ☑ / ☐ to track ownership or crafting.
 class YugiohPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
+        await this.loadDataFiles();
         this.addSettingTab(new YugiohSettingTab(this.app, this));
         this.addCommand({
             id: 'open-deck-ui',
@@ -583,6 +626,44 @@ class YugiohPlugin extends Plugin {
             name: '📄 Create Deck Template in Templates folder',
             callback: () => this.createDeckTemplate()
         });
+        this.addCommand({
+            id: 'reload-yugioh-data-files',
+            name: '🔄 Reload rarity/banlist data files',
+            callback: () => this.loadDataFiles(true)
+        });
+    }
+
+    // Reads md-rarities.json and md-banlist.json from the plugin's own folder
+    // (via the vault adapter, NOT Node's fs — this keeps it working on mobile,
+    // where isDesktopOnly: false promises support). Both are optional; a
+    // missing/broken file just means "nothing known" for that lookup rather
+    // than a load failure, so the plugin still works out of the box.
+    async loadDataFiles(notify = false) {
+        this.rarityDB = await this.readJsonFile('md-rarities.json', MD_RARITY_FALLBACK);
+        const banlistFile = await this.readJsonFile('md-banlist.json', { cards: MD_BANLIST_FALLBACK });
+        this.banlistDB = banlistFile.cards || banlistFile; // tolerate a bare {name: status} file too
+        this.banlistMeta = banlistFile._meta || null;
+        if (notify) {
+            const n = Object.keys(this.rarityDB).length, b = Object.keys(this.banlistDB).length;
+            new Notice(`🔄 Reloaded data: ${n} rarities, ${b} banlist entries`);
+        }
+    }
+
+    async readJsonFile(fileName, fallback) {
+        try {
+            const path = `${this.manifest.dir}/${fileName}`;
+            const raw = await this.app.vault.adapter.read(path);
+            return JSON.parse(raw);
+        } catch (err) {
+            console.error(`[YugiohPlugin] Could not load ${fileName}, using fallback:`, err);
+            return fallback;
+        }
+    }
+
+    // Master Duel banlist status for a card, defaulting to Unlimited for
+    // anything not present in md-banlist.json.
+    getBanStatusMD(name) {
+        return (this.banlistDB && this.banlistDB[name]) || 'Unlimited';
     }
 
     async loadSettings() {
@@ -683,7 +764,7 @@ class YugiohPlugin extends Plugin {
         const resolvedName = ALIASES[normalisedName] || normalisedName;
         try {
             const res = await fetch(
-                `https://db.ygoprodeck.com/api/v7/cardinfo.php?name=${encodeURIComponent(resolvedName)}`
+                `https://db.ygoprodeck.com/api/v7/cardinfo.php?name=${encodeURIComponent(resolvedName)}&misc=yes`
             );
             if (!res.ok) return null;
             const data = await res.json();
@@ -694,13 +775,28 @@ class YugiohPlugin extends Plugin {
                 desc: c.desc, image: c.card_images[0].image_url,
                 archetype: c.archetype,
                 ban_tcg: c.banlist_info?.ban_tcg || 'Unlimited',
-                rarity: MD_RARITY_DB[c.name] || this.getRarity(c),
+                ban_md: this.getBanStatusMD(c.name),
+                rarity: this.rarityDB[c.name] || this.normalizeMdRarity(c.misc_info?.[0]?.md_rarity) || this.getRarity(c),
                 frameType: c.frameType
             };
         } catch (err) {
             console.error('[YugiohPlugin] fetchCard error:', err);
             return null;
         }
+    }
+
+    // API misc_info.md_rarity comes back as a full word ("Ultra Rare") rather
+    // than the UR/SR/R/N abbreviation the rest of the plugin uses — normalize
+    // it, or return null (not 'N') when absent so callers can fall through to
+    // the type-based heuristic instead of wrongly treating "no data" as Normal.
+    normalizeMdRarity(raw) {
+        if (!raw) return null;
+        if (/^[A-Z]{1,3}$/.test(raw)) return raw; // already abbreviated
+        const map = {
+            'ultra rare': 'UR', 'super rare': 'SR', 'rare': 'R',
+            'normal': 'N', 'common': 'N'
+        };
+        return map[raw.toLowerCase()] || null;
     }
 
     // Combo steps often use shorthand/nicknames ("Chamber", "Sheou", "Tidying (GY)")
@@ -716,7 +812,7 @@ class YugiohPlugin extends Plugin {
         if (cleaned.length < 3) return [];
         try {
             const res = await fetch(
-                `https://db.ygoprodeck.com/api/v7/cardinfo.php?fname=${encodeURIComponent(cleaned)}`
+                `https://db.ygoprodeck.com/api/v7/cardinfo.php?fname=${encodeURIComponent(cleaned)}&misc=yes`
             );
             if (!res.ok) {
                 // 429 (rate limited) is common when many fuzzy lookups fire in quick
@@ -738,7 +834,8 @@ class YugiohPlugin extends Plugin {
                     desc: c.desc, image: c.card_images[0].image_url,
                     archetype: c.archetype,
                     ban_tcg: c.banlist_info?.ban_tcg || 'Unlimited',
-                    rarity: MD_RARITY_DB[c.name] || this.getRarity(c),
+                    ban_md: this.getBanStatusMD(c.name),
+                    rarity: this.rarityDB[c.name] || this.normalizeMdRarity(c.misc_info?.[0]?.md_rarity) || this.getRarity(c),
                     frameType: c.frameType
                 }));
         } catch (err) {
@@ -834,6 +931,7 @@ class DeckUI extends Modal {
         const addBtn = this.makeBtn(searchRow, '＋ Add', '#e8c84a', '#0d0f1a');
         const loadBtn = this.makeBtn(searchRow, '🔄 Reload', '#c084f5', '#fff');
         const statsBtn = this.makeBtn(searchRow, '📊 Stats', '#60a5fa', '#fff');
+        const validateBtn = this.makeBtn(searchRow, '✅ Validate', '#4ade80', '#0d0f1a');
         const applyTplBtn = this.makeBtn(searchRow, '🗋 Apply Template', '#1f2937', '#f87171');
         applyTplBtn.title = 'Overwrite the current note with the blank deck template';
 
@@ -849,6 +947,7 @@ class DeckUI extends Modal {
             { key: 'main40', label: '🟢 40-Card Variant', color: '#4ade80' },
             { key: 'extra', label: '🟥 Extra Deck', color: '#f87171' },
             { key: 'combos', label: '🧠 Combos', color: '#a78bfa' },
+            { key: 'hand', label: '🎲 Test Hand', color: '#e8c84a' },
         ];
         this.tabEls = {};
         for (const tab of TABS) {
@@ -894,29 +993,49 @@ class DeckUI extends Modal {
             const name = input.value.trim();
             if (!name) return new Notice('Enter a card name.');
             if (this.loading) return;
+
+            const group = this.activeTab;
+            if (!this.decks[group]) {
+                return new Notice(`Switch to Main Deck, 40-Card Variant, or Extra Deck to add cards (not "${group}").`);
+            }
+
             this.loading = true; addBtn.disabled = true;
             this.setStatus(`Fetching "${name}"…`);
 
-            const card = await this.plugin.fetchCard(name);
+            const fetched = await this.plugin.fetchCard(name);
             this.loading = false; addBtn.disabled = false;
 
-            if (!card) {
+            if (!fetched) {
                 this.setStatus(`❌ Not found: "${name}"`);
                 return new Notice(`Card not found: "${name}"`);
             }
 
-            card.owned = true;
-            card.deckGroup = this.activeTab;
-            this.decks[this.activeTab].push(card);
-            this.allCards.push(card);
-            this.renderCard(card, this.grid);
-            this.setStatus(`✅ Added "${card.name}" [${card.rarity}] to ${this.activeTab} — saving…`);
+            // Stack onto an existing entry for the same card in this section
+            // instead of adding a second tile for it.
+            const existing = this.decks[group].find(c => c.name.toLowerCase() === fetched.name.toLowerCase());
+            let entry;
+            if (existing) {
+                existing.count = (existing.count || 1) + 1;
+                existing.owned = true;
+                entry = existing;
+            } else {
+                fetched.owned = true;
+                fetched.count = 1;
+                fetched.deckGroup = group;
+                this.decks[group].push(fetched);
+                this.allCards.push(fetched);
+                entry = fetched;
+            }
+
+            this.switchTab(group); // re-render from this.decks so counts/tiles stay in sync
+            this.setStatus(`✅ "${entry.name}" [${entry.rarity}] ×${entry.count} in ${group} — saving…`);
             input.value = '';
-            await this.saveCardToTemplate(card);
+            await this.saveCardToTemplate(entry);
         };
 
         loadBtn.onclick = () => this.loadFromTemplate();
         statsBtn.onclick = () => this.showStats();
+        validateBtn.onclick = () => this.showValidation();
         applyTplBtn.onclick = () => this.confirmApplyTemplate();
 
         // Auto-load on open
@@ -1048,6 +1167,7 @@ class DeckUI extends Modal {
             main40: '🟢 40-Card Variant',
             extra: '🟥 Extra Deck',
             combos: '🧠 Combos',
+            hand: '🎲 Test Hand',
         };
         // Update tab button styles
         for (const [k, { btn, color }] of Object.entries(this.tabEls)) {
@@ -1075,6 +1195,9 @@ class DeckUI extends Modal {
                 this.grid.empty();
                 this.renderCombos(this.grid);
             });
+        } else if (key === 'hand') {
+            this.grid.style.display = 'block';
+            this.renderHandSimulator(this.grid);
         } else {
             this.grid.style.display = 'grid';
             const cards = this.decks[key] || [];
@@ -1088,6 +1211,116 @@ class DeckUI extends Modal {
             } else {
                 for (const card of cards) this.renderCard(card, this.grid);
             }
+        }
+    }
+
+    // ── Opening Hand Simulator ──────────────────────────────────────────────
+    // Draws from the 40-card variant if it has cards (an exact, fixed pool),
+    // otherwise the 40–60 Main Deck. Extra Deck is never drawn from.
+    buildDrawPool() {
+        const hasVariant = this.decks.main40.length > 0;
+        const mainCards = hasVariant ? this.decks.main40 : this.decks.main60;
+        const pool = [];
+        for (const c of mainCards) {
+            const copies = c.count || 1;
+            for (let i = 0; i < copies; i++) pool.push(c);
+        }
+        return pool;
+    }
+
+    shuffleSample(arr, n) {
+        const copy = arr.slice();
+        for (let i = copy.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [copy[i], copy[j]] = [copy[j], copy[i]];
+        }
+        return copy.slice(0, Math.min(n, copy.length));
+    }
+
+    renderHandSimulator(container) {
+        const pool = this.buildDrawPool();
+        const usingVariant = this.decks.main40.length > 0;
+
+        const controls = container.createEl('div');
+        controls.style.cssText = `
+            display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center;
+        `;
+
+        const info = controls.createEl('span');
+        info.style.cssText = 'font-size: 0.75em; color: #6b7280; font-family: monospace; margin-right: auto;';
+        info.textContent = pool.length > 0
+            ? `Pool: ${pool.length} cards (${usingVariant ? '40-Card Variant' : 'Main Deck'})`
+            : 'No main deck cards loaded — load a deck first.';
+
+        const draw5Btn = this.makeBtn(controls, '🎲 Draw 5 · Going First', '#e8c84a', '#0d0f1a');
+        const draw6Btn = this.makeBtn(controls, '🎲 Draw 6 · Going Second', '#c084f5', '#fff');
+        const redrawBtn = this.makeBtn(controls, '🔄 Redraw', '#60a5fa', '#fff');
+
+        const handWrap = container.createEl('div');
+        handWrap.style.cssText = 'display: flex; gap: 10px; flex-wrap: wrap; padding: 6px 0;';
+
+        const renderHand = () => {
+            handWrap.empty();
+            if (!this.currentHand || this.currentHand.length === 0) {
+                const empty = handWrap.createEl('div');
+                empty.style.cssText = `
+                    color: #4b5563; font-family: monospace; font-size: 0.85em;
+                    padding: 30px 0; width: 100%; text-align: center;
+                `;
+                empty.textContent = 'Draw a hand to see it here.';
+                return;
+            }
+            for (const card of this.currentHand) this.renderHandCard(card, handWrap);
+            const trapCount = this.currentHand.filter(c => HAND_TRAPS.includes(c.name)).length;
+            if (trapCount > 0) {
+                const note = handWrap.createEl('div');
+                note.style.cssText = 'width: 100%; font-size: 0.72em; color: #facc15; font-family: monospace; margin-top: 4px;';
+                note.textContent = `🪤 ${trapCount} hand trap${trapCount > 1 ? 's' : ''} in this hand`;
+            }
+        };
+
+        const doDraw = n => {
+            if (pool.length === 0) { new Notice('No main deck cards to draw from — load a deck first.'); return; }
+            this.lastHandSize = n;
+            this.currentHand = this.shuffleSample(pool, n);
+            renderHand();
+        };
+
+        draw5Btn.onclick = () => doDraw(5);
+        draw6Btn.onclick = () => doDraw(6);
+        redrawBtn.onclick = () => doDraw(this.lastHandSize || 5);
+
+        renderHand();
+    }
+
+    // Lightweight, non-interactive card tile for the hand simulator — unlike
+    // renderCard(), clicking it doesn't toggle "owned" in the deck template.
+    renderHandCard(card, container) {
+        const rarityColor = RARITY_COLOR[card.rarity] || '#94a3b8';
+        const wrap = container.createEl('div');
+        wrap.style.cssText = `
+            display: flex; flex-direction: column; align-items: center;
+            background: #111827; border-radius: 8px; padding: 8px 5px 9px;
+            border: 1.5px solid ${rarityColor}77; width: 106px;
+        `;
+        wrap.title = `${card.name}\n${card.type}\n${card.desc?.slice(0, 140) ?? ''}…`;
+
+        const img = wrap.createEl('img');
+        img.src = card.image;
+        img.style.cssText = 'width: 82px; border-radius: 4px; display: block;';
+
+        const nameEl = wrap.createEl('div');
+        nameEl.textContent = card.name.length > 17 ? card.name.slice(0, 15) + '…' : card.name;
+        nameEl.style.cssText = `
+            font-size: 0.6em; text-align: center; color: #cbd5e1;
+            margin-top: 5px; line-height: 1.3; max-width: 100px;
+            font-family: monospace;
+        `;
+
+        if (HAND_TRAPS.includes(card.name)) {
+            const tag = wrap.createEl('div');
+            tag.textContent = '🪤 Hand Trap';
+            tag.style.cssText = 'font-size: 0.54em; color: #facc15; margin-top: 2px; font-family: monospace;';
         }
     }
 
@@ -1693,10 +1926,12 @@ class DeckUI extends Modal {
         rarityEl.textContent = RARITY_LABEL[card.rarity] || card.rarity;
         rarityEl.style.cssText = `font-size: 0.58em; font-weight: bold; color: ${rarityColor}; margin-top: 2px; font-family: monospace;`;
 
-        // Ban status
-        if (card.ban_tcg && card.ban_tcg !== 'Unlimited') {
+        // Ban status (Master Duel — falls back to Unlimited for cards not in
+        // md-banlist.json, which also covers cards fetched before that file existed)
+        const banStatus = card.ban_md || this.plugin.getBanStatusMD(card.name);
+        if (banStatus && banStatus !== 'Unlimited') {
             const banEl = wrap.createEl('div');
-            banEl.textContent = `⚠ ${card.ban_tcg}`;
+            banEl.textContent = `⚠ MD: ${banStatus}`;
             banEl.style.cssText = 'font-size: 0.54em; color: #f87171; margin-top: 2px; font-family: monospace;';
         }
 
@@ -1723,25 +1958,83 @@ class DeckUI extends Modal {
             return;
         }
 
-        // Only treat it as "already there" if it's an actual card entry in this
-        // same deck section — not just any mention of the name anywhere in the
-        // note (e.g. inside a combo line or the budget checklist).
-        const target = card.name.toLowerCase();
-        const already = parseCardsFromMarkdown(content).some(
-            e => e.deckGroup === card.deckGroup && e.name.toLowerCase() === target
-        );
-        if (already) {
-            this.setStatus(`ℹ️ "${card.name}" already in ${card.deckGroup}.`);
-            return;
-        }
-
-        const updated = appendCardToSection(content, card);
+        // Note: unlike before, an existing line for this card is no longer a
+        // reason to skip the write — upsertCardInTemplate rewrites it in
+        // place with the card's current (possibly just-incremented) count.
+        const updated = upsertCardInTemplate(content, card);
         const success = await this.plugin.writeTemplate(updated);
         if (!success) {
             this.setStatus(`❌ Failed to save "${card.name}" — no active file found.`);
             return;
         }
-        this.setStatus(`💾 "${card.name}" appended to template.`);
+        this.setStatus(`💾 "${card.name}" ×${card.count || 1} saved to template.`);
+    }
+
+    // Checks main/extra deck sizes and per-card Master Duel copy limits.
+    // Uses the 40-card variant as "the main deck" when it has cards (since
+    // that's a deliberate, exact-40 build), otherwise the 40–60 main deck.
+    // Copy limits are checked against main+extra combined (Side Deck isn't
+    // tracked by this plugin, so it's excluded).
+    validateDeck() {
+        const hasVariant = this.decks.main40.length > 0;
+        const mainKey = hasVariant ? 'main40' : 'main60';
+        const mainCards = this.decks[mainKey];
+        const extraCards = this.decks.extra;
+
+        const sumCopies = cards => cards.reduce((n, c) => n + (c.count || 1), 0);
+        const mainCount = sumCopies(mainCards);
+        const extraCount = sumCopies(extraCards);
+        const mainMin = 40, mainMax = hasVariant ? 40 : 60, extraMax = 15;
+
+        const errors = [], warnings = [];
+        if (mainCount < mainMin || mainCount > mainMax) {
+            errors.push(`Main Deck has ${mainCount} cards (needs ${mainMin}${mainMax !== mainMin ? `–${mainMax}` : ''})`);
+        }
+        if (extraCount > extraMax) {
+            errors.push(`Extra Deck has ${extraCount} cards (max ${extraMax})`);
+        }
+
+        const combined = new Map(); // name -> total copies across main+extra
+        for (const c of [...mainCards, ...extraCards]) {
+            combined.set(c.name, (combined.get(c.name) || 0) + (c.count || 1));
+        }
+        for (const [name, total] of combined) {
+            const status = this.plugin.getBanStatusMD(name);
+            const limit = BANLIST_COPY_LIMIT[status] ?? 3;
+            if (total > limit) {
+                errors.push(limit === 0
+                    ? `"${name}" is Forbidden in Master Duel (×${total} in deck)`
+                    : `"${name}" exceeds its Master Duel limit — ${status}: ${total}/${limit}`);
+            } else if (status !== 'Unlimited') {
+                warnings.push(`"${name}" is ${status} in Master Duel (${total}/${limit})`);
+            }
+        }
+
+        return { mainKey, mainCount, mainMin, mainMax, extraCount, extraMax, errors, warnings };
+    }
+
+    showValidation() {
+        if (this.allCards.length === 0) return new Notice('No cards loaded.');
+        const r = this.validateDeck();
+        const valid = r.errors.length === 0;
+        const lines = [
+            valid ? '🟢 DECK VALID' : '🔴 DECK INVALID',
+            '─────────────────',
+            `${r.mainKey === 'main40' ? 'Main Deck (40)' : 'Main Deck'}   ${r.mainCount} / ${r.mainMax}`,
+            `Extra Deck      ${r.extraCount} / ${r.extraMax}`,
+        ];
+        if (r.errors.length) {
+            lines.push('', 'Errors:');
+            r.errors.forEach(e => lines.push(`❌ ${e}`));
+        }
+        if (r.warnings.length) {
+            lines.push('', 'Warnings:');
+            r.warnings.forEach(w => lines.push(`⚠ ${w}`));
+        }
+        if (this.plugin.banlistMeta?.asOf) {
+            lines.push('', `(Banlist as of ${this.plugin.banlistMeta.asOf})`);
+        }
+        new Notice(lines.join('\n'), 15000);
     }
 
     showStats() {
