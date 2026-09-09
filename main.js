@@ -103,6 +103,19 @@ function computeLineGroups(lines) {
 // rarity are NOT required — real deck lists are often just "- [ ] Card Name".
 const CARD_LINE_RE = /^-\s*(?:(\[[ xX]\]|☐|☑)\s+)?(.+)$/;
 
+// Markdown horizontal-rule dividers ("---", "----", etc., used between
+// sections) would otherwise match CARD_LINE_RE too — "-" is technically a
+// valid (degenerate) card name under that regex, so a divider line parses as
+// a bare card called "--". That created a phantom card entry AND, worse,
+// made insertion logic treat the divider as "the last card line" in a
+// section, splicing newly-added cards in right after the "---" instead of
+// after the real last card. isCardLine() is the guarded check to use
+// anywhere CARD_LINE_RE is used to identify an actual card line.
+const HR_RE = /^-{3,}\s*$/;
+function isCardLine(line) {
+    return CARD_LINE_RE.test(line) && !HR_RE.test(line.trim());
+}
+
 // Returns the Monster/Spell/Trap bucket this heading EXPLICITLY changes to,
 // or null to inherit from its parent heading. Mirrors explicitGroup's
 // depth-based reset logic, but for the Monsters/Spells/Traps subsections
@@ -204,8 +217,8 @@ function parseCardsFromMarkdown(content) {
         const group = groups[i];
         if (!group) continue;
 
+        if (!isCardLine(lines[i])) continue;
         const m = lines[i].match(CARD_LINE_RE);
-        if (!m) continue;
 
         const checkboxMarker = m[1];
         const { name, count, rarity } = parseEntryText(m[2]);
@@ -374,7 +387,7 @@ function appendCardToSection(content, card) {
     let headingIdxForType = -1;
     for (let i = 0; i < lines.length; i++) {
         if (groups[i] !== groupKey) continue;
-        if (typeGroups[i] === cardType && CARD_LINE_RE.test(lines[i])) lastIdxInType = i;
+        if (typeGroups[i] === cardType && isCardLine(lines[i])) lastIdxInType = i;
         if (headingIdxForType === -1 && groups[i] === groupKey && /^#{1,6}\s/.test(lines[i]) && explicitTypeGroup(lines[i]) === cardType) {
             headingIdxForType = i;
         }
@@ -394,7 +407,7 @@ function appendCardToSection(content, card) {
     let lastIdxInGroup = -1;
     let headingIdxForGroup = -1;
     for (let i = 0; i < lines.length; i++) {
-        if (groups[i] === groupKey && CARD_LINE_RE.test(lines[i])) lastIdxInGroup = i;
+        if (groups[i] === groupKey && isCardLine(lines[i])) lastIdxInGroup = i;
         if (headingIdxForGroup === -1 && /^#{1,4}\s/.test(lines[i]) && explicitGroup(lines[i]) === groupKey) {
             headingIdxForGroup = i;
         }
@@ -447,6 +460,46 @@ function upsertCardInTemplate(content, card) {
     }
 
     return appendCardToSection(content, card);
+}
+
+// Removes ONE copy of a card from its deck-group section in the markdown.
+// Matches by parsed name (count/rarity-agnostic), scoped to the given deck
+// group only — so removing "Ash Blossom" from the 40-card variant doesn't
+// also touch the copy in the 60-card Main Deck if it's listed in both. If
+// the line's count is >1, the line is rewritten with count-1; only when the
+// count hits 0 is the line deleted entirely. Returns
+// { content, removed, newCount } — removed is true only when the line was
+// deleted (last copy). If no matching line is found, returns the content
+// unchanged with removed: false.
+function decrementCardInTemplate(content, cardName, deckGroup) {
+    const eol = detectEOL(content);
+    const lines = splitLines(content);
+    const groups = computeLineGroups(lines);
+    const target = cardName.trim().toLowerCase();
+
+    const idx = lines.findIndex((line, i) => {
+        if (groups[i] !== deckGroup) return false;
+        const m = line.match(CARD_LINE_RE);
+        if (!m) return false;
+        const { name } = parseEntryText(m[2]);
+        return name.toLowerCase() === target;
+    });
+
+    if (idx === -1) return { content, removed: false, newCount: 0 };
+
+    const m = lines[idx].match(CARD_LINE_RE);
+    const { name, count, rarity } = parseEntryText(m[2]);
+    const newCount = count - 1;
+
+    if (newCount <= 0) {
+        lines.splice(idx, 1);
+        return { content: lines.join(eol), removed: true, newCount: 0 };
+    }
+
+    const checkbox = m[1];
+    const prefix = checkbox !== undefined ? `- ${checkbox} ` : '- ';
+    lines[idx] = `${prefix}${name} ×${newCount} [${rarity}]`;
+    return { content: lines.join(eol), removed: false, newCount };
 }
 
 const DECK_TEMPLATE = `# 🐉 Deck Template – Master Duel (Obsidian)
@@ -1935,6 +1988,31 @@ class DeckUI extends Modal {
             banEl.style.cssText = 'font-size: 0.54em; color: #f87171; margin-top: 2px; font-family: monospace;';
         }
 
+        // Remove button (bottom-right) — removes ONE copy of this card from
+        // this deck group (decrements ×N, or deletes the line once the last
+        // copy is gone). Faint until hovered so it doesn't compete visually
+        // with the rest of the tile.
+        const removeBtn = wrap.createEl('div');
+        removeBtn.textContent = '✕';
+        removeBtn.title = card.count > 1
+            ? `Remove 1 copy of "${card.name}" (×${card.count})`
+            : `Remove "${card.name}" from this deck`;
+        removeBtn.style.cssText = `
+            position: absolute; bottom: 4px; right: 5px;
+            width: 15px; height: 15px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            background: #1f2937; color: #f87171; font-size: 0.62em;
+            font-family: monospace; font-weight: bold; line-height: 1;
+            opacity: 0.45; transition: opacity .15s, background .15s;
+            cursor: pointer;
+        `;
+        removeBtn.onmouseenter = () => { removeBtn.style.opacity = '1'; removeBtn.style.background = '#7f1d1d'; };
+        removeBtn.onmouseleave = () => { removeBtn.style.opacity = '0.45'; removeBtn.style.background = '#1f2937'; };
+        removeBtn.onclick = async (e) => {
+            e.stopPropagation(); // don't also trigger the tile's owned-toggle
+            await this.removeCardFromDeck(card);
+        };
+
         // Click = toggle owned in template
         wrap.onclick = async () => {
             card.owned = !card.owned;
@@ -1968,6 +2046,42 @@ class DeckUI extends Modal {
             return;
         }
         this.setStatus(`💾 "${card.name}" ×${card.count || 1} saved to template.`);
+    }
+
+    // Removes ONE copy of a card's line from its deck group in the template.
+    // If that leaves the entry with count 0 (i.e. it was the last copy), the
+    // tile is dropped from the in-memory decks/allCards; otherwise the tile
+    // stays and just shows the decremented ×N. Scoped to card.deckGroup so
+    // removing a card from one section (e.g. the 40-card variant) never
+    // touches its entry in another (e.g. Main Deck).
+    async removeCardFromDeck(card) {
+        const group = card.deckGroup;
+        if (!this.decks[group]) return;
+
+        const content = await this.plugin.readTemplate();
+        if (!content) {
+            this.setStatus(`⚠️ Could not read the active file — "${card.name}" was not removed.`);
+            return;
+        }
+
+        const { content: updated, removed, newCount } = decrementCardInTemplate(content, card.name, group);
+        const success = await this.plugin.writeTemplate(updated);
+        if (!success) {
+            this.setStatus(`❌ Failed to remove "${card.name}" — no active file found.`);
+            return;
+        }
+
+        if (removed) {
+            this.decks[group] = this.decks[group].filter(c => c !== card);
+            this.allCards = this.allCards.filter(c => c !== card);
+            this.setStatus(`🗑️ "${card.name}" removed from template.`);
+            new Notice(`🗑️ Removed "${card.name}"`);
+        } else {
+            card.count = newCount;
+            this.setStatus(`➖ "${card.name}" now ×${newCount} in ${group}.`);
+        }
+
+        this.switchTab(this.activeTab);
     }
 
     // Checks main/extra deck sizes and per-card Master Duel copy limits.
