@@ -1976,15 +1976,21 @@ class DeckUI extends Modal {
     // Copy limits are checked against main+extra combined (Side Deck isn't
     // tracked by this plugin, so it's excluded).
     validateDeck() {
-        const hasVariant = this.decks.main40.length > 0;
-        const mainKey = hasVariant ? 'main40' : 'main60';
+        // Validate whichever main-deck tab the user is currently viewing.
+        // If they're on a non-deck tab (Extra/Combos/Test Hand) when they hit
+        // Validate, fall back to the 40-card variant when it has cards,
+        // otherwise the 60-card Main Deck — same default as before.
+        const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
+        const mainKey = onDeckTab
+            ? this.activeTab
+            : (this.decks.main40.length > 0 ? 'main40' : 'main60');
         const mainCards = this.decks[mainKey];
         const extraCards = this.decks.extra;
 
         const sumCopies = cards => cards.reduce((n, c) => n + (c.count || 1), 0);
         const mainCount = sumCopies(mainCards);
         const extraCount = sumCopies(extraCards);
-        const mainMin = 40, mainMax = hasVariant ? 40 : 60, extraMax = 15;
+        const mainMin = 40, mainMax = mainKey === 'main40' ? 40 : 60, extraMax = 15;
 
         const errors = [], warnings = [];
         if (mainCount < mainMin || mainCount > mainMax) {
