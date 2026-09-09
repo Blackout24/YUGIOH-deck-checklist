@@ -21,6 +21,10 @@ const BANLIST_COPY_LIMIT = {
     'Forbidden': 0, 'Limited 1': 1, 'Limited 2': 2, 'Unlimited': 3
 };
 
+// If the banlist snapshot's _meta.asOf date is older than this, the plugin
+// nags (once per Obsidian session) to run the Update Banlist command.
+const BANLIST_STALE_DAYS = 30;
+
 const DEFAULT_SETTINGS = {};
 
 // ── Shared line/section helpers ──────────────────────────────────────────────
@@ -684,6 +688,15 @@ class YugiohPlugin extends Plugin {
             name: '🔄 Reload rarity/banlist data files',
             callback: () => this.loadDataFiles(true)
         });
+        this.addCommand({
+            id: 'update-banlist',
+            name: '🔄 Update Banlist (paste latest)',
+            callback: () => new UpdateBanlistModal(this.app, this).open()
+        });
+        // One nag per Obsidian launch if the banlist snapshot is stale —
+        // there's no stable public API for the Master Duel banlist to poll,
+        // so this is what stands in for an automatic monthly check.
+        this.checkBanlistFreshness();
     }
 
     // Reads md-rarities.json and md-banlist.json from the plugin's own folder
@@ -711,6 +724,43 @@ class YugiohPlugin extends Plugin {
             console.error(`[YugiohPlugin] Could not load ${fileName}, using fallback:`, err);
             return fallback;
         }
+    }
+
+    // Writes a plugin data file (e.g. md-banlist.json) via the vault adapter
+    // — same mechanism readJsonFile uses, so this stays mobile-compatible.
+    async writeDataFile(fileName, content) {
+        try {
+            const path = `${this.manifest.dir}/${fileName}`;
+            await this.app.vault.adapter.write(path, content);
+            return true;
+        } catch (err) {
+            console.error(`[YugiohPlugin] Could not write ${fileName}:`, err);
+            return false;
+        }
+    }
+
+    // Days since the banlist's _meta.asOf date, or null if that date is
+    // missing/unparseable. Used for the startup staleness nag and to show
+    // "X days old" in the Update Banlist modal and settings tab.
+    getBanlistAgeDays() {
+        const asOf = this.banlistMeta?.asOf;
+        if (!asOf) return null;
+        const then = new Date(asOf + 'T00:00:00');
+        if (isNaN(then.getTime())) return null;
+        return Math.floor((Date.now() - then.getTime()) / (1000 * 60 * 60 * 24));
+    }
+
+    // Nags once per launch if the banlist snapshot is older than
+    // BANLIST_STALE_DAYS. Master Duel's banlist isn't exposed via any
+    // stable public API, so this is a reminder to run "🔄 Update Banlist"
+    // and paste in the latest list rather than an automatic fetch.
+    checkBanlistFreshness() {
+        const days = this.getBanlistAgeDays();
+        if (days === null || days < BANLIST_STALE_DAYS) return;
+        new Notice(
+            `⚠️ Master Duel banlist is ${days} days old (dated ${this.banlistMeta.asOf}). Run "🔄 Update Banlist" to refresh it.`,
+            10000
+        );
     }
 
     // Master Duel banlist status for a card, defaulting to Unlimited for
@@ -2237,6 +2287,111 @@ class DeckUI extends Modal {
     }
 }
 
+// Lets the user paste an updated Master Duel banlist and saves it to
+// md-banlist.json, stamping today's date as the new asOf. This is the
+// "monthly update" workflow: there's no stable public API for the Master
+// Duel banlist to poll, so rather than scraping a page that can silently
+// break, the user pastes the current Forbidden/Limited list (e.g. copied
+// from wargamer.com or the in-game banlist screen) and the plugin handles
+// the file format, validation, and live reload.
+class UpdateBanlistModal extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.style.cssText = 'font-family: monospace; font-size: 0.88em; color: #e2e8f0;';
+        this.titleEl.textContent = '🔄 Update Master Duel Banlist';
+
+        const meta = this.plugin.banlistMeta;
+        const ageDays = this.plugin.getBanlistAgeDays();
+        const statusLine = contentEl.createEl('p');
+        statusLine.style.cssText = 'color: #94a3b8; margin-bottom: 4px;';
+        statusLine.textContent = meta?.asOf
+            ? `Current snapshot dated ${meta.asOf}${ageDays !== null ? ` (${ageDays} days old)` : ''}.`
+            : 'No banlist metadata found yet.';
+
+        contentEl.createEl('p', {
+            text: 'Edit the JSON below — "Card Name": "Forbidden" | "Limited 1" | "Limited 2". Anything left out is treated as Unlimited. It\'s pre-filled with the current list, so just add/remove/change entries for what changed this month.'
+        }).style.cssText = 'color: #94a3b8; margin-bottom: 10px;';
+
+        const sourceRow = contentEl.createEl('div');
+        sourceRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 8px; align-items: center;';
+        sourceRow.createEl('label', { text: 'Source URL:' }).style.cssText = 'color: #cbd5e1; min-width: 90px;';
+        const sourceInput = sourceRow.createEl('input');
+        sourceInput.value = meta?.source || 'https://www.wargamer.com/yu-gi-oh-master-duel/banlist';
+        sourceInput.style.cssText = 'flex: 1; background: #1f2937; border: 1px solid #374151; border-radius: 5px; padding: 5px 8px; color: #e2e8f0; font-family: monospace; font-size: 0.9em;';
+
+        const dateRow = contentEl.createEl('div');
+        dateRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 10px; align-items: center;';
+        dateRow.createEl('label', { text: 'As of date:' }).style.cssText = 'color: #cbd5e1; min-width: 90px;';
+        const dateInput = dateRow.createEl('input');
+        dateInput.type = 'text';
+        dateInput.placeholder = 'YYYY-MM-DD';
+        dateInput.value = new Date().toISOString().slice(0, 10);
+        dateInput.style.cssText = 'background: #1f2937; border: 1px solid #374151; border-radius: 5px; padding: 5px 8px; color: #e2e8f0; font-family: monospace; font-size: 0.9em; width: 130px;';
+
+        const textarea = contentEl.createEl('textarea');
+        textarea.rows = 14;
+        textarea.style.cssText = `
+            width: 100%; background: #0d0f1a; border: 1px solid #374151;
+            border-radius: 6px; padding: 10px; color: #e2e8f0;
+            font-family: monospace; font-size: 0.82em; resize: vertical;
+        `;
+        textarea.placeholder = '{\n  "Card Name": "Forbidden",\n  "Another Card": "Limited 1"\n}';
+        textarea.value = JSON.stringify(this.plugin.banlistDB || {}, null, 4);
+
+        const btnRow = contentEl.createEl('div');
+        btnRow.style.cssText = 'display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px;';
+
+        const cancelBtn = btnRow.createEl('button', { text: 'Cancel' });
+        cancelBtn.style.cssText = 'background: #374151; color: #e2e8f0; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: monospace;';
+        cancelBtn.onclick = () => this.close();
+
+        const saveBtn = btnRow.createEl('button', { text: '💾 Save Banlist' });
+        saveBtn.style.cssText = 'background: #7c3aed; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-family: monospace; font-weight: bold;';
+        saveBtn.onclick = async () => {
+            let parsed;
+            try {
+                parsed = JSON.parse(textarea.value);
+            } catch (err) {
+                return new Notice(`❌ Invalid JSON: ${err.message}`);
+            }
+            if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
+                return new Notice('❌ Expected a flat object of "Card Name": "Status" pairs.');
+            }
+            const validStatuses = new Set(Object.keys(BANLIST_COPY_LIMIT));
+            const badEntry = Object.entries(parsed).find(([, status]) => !validStatuses.has(status));
+            if (badEntry) {
+                return new Notice(`❌ "${badEntry[0]}" has invalid status "${badEntry[1]}". Use Forbidden, Limited 1, Limited 2, or Unlimited.`);
+            }
+
+            const asOf = dateInput.value.trim() || new Date().toISOString().slice(0, 10);
+            const fileContent = {
+                _meta: {
+                    format: 'Master Duel',
+                    asOf,
+                    source: sourceInput.value.trim(),
+                    note: 'Community-sourced snapshot, not an official Konami feed. Updated via the plugin\'s Update Banlist command.'
+                },
+                cards: parsed
+            };
+
+            const success = await this.plugin.writeDataFile('md-banlist.json', JSON.stringify(fileContent, null, 4));
+            if (!success) {
+                return new Notice('❌ Failed to write md-banlist.json.');
+            }
+            await this.plugin.loadDataFiles(false);
+            new Notice(`✅ Banlist updated — ${Object.keys(parsed).length} entries, dated ${asOf}.`);
+            this.close();
+        };
+    }
+
+    onClose() { this.contentEl.empty(); }
+}
+
 class YugiohSettingTab extends PluginSettingTab {
     constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
 
@@ -2260,6 +2415,23 @@ class YugiohSettingTab extends PluginSettingTab {
                 .setButtonText('📄 Create Template')
                 .setCta()
                 .onClick(() => this.plugin.createDeckTemplate())
+            );
+
+        containerEl.createEl('h3', { text: '🚫 Master Duel Banlist' });
+        const meta = this.plugin.banlistMeta;
+        const ageDays = this.plugin.getBanlistAgeDays();
+        containerEl.createEl('p', {
+            text: meta?.asOf
+                ? `Current snapshot dated ${meta.asOf}${ageDays !== null ? ` (${ageDays} days old)` : ''}. There's no public API for the Master Duel banlist, so this stays a manual paste-in — update it monthly, or whenever a new banlist drops (the plugin will nag you at 30+ days).`
+                : 'No banlist data loaded yet.'
+        });
+        new Setting(containerEl)
+            .setName('Update banlist')
+            .setDesc('Paste in the latest Forbidden/Limited list and save — updates md-banlist.json and reloads it immediately.')
+            .addButton(btn => btn
+                .setButtonText('🔄 Update Banlist')
+                .setCta()
+                .onClick(() => new UpdateBanlistModal(this.app, this.plugin).open())
             );
     }
 }
