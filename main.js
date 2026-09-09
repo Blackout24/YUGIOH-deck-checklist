@@ -1977,13 +1977,12 @@ class DeckUI extends Modal {
     // tracked by this plugin, so it's excluded).
     validateDeck() {
         // Validate whichever main-deck tab the user is currently viewing.
-        // If they're on a non-deck tab (Extra/Combos/Test Hand) when they hit
-        // Validate, fall back to the 40-card variant when it has cards,
-        // otherwise the 60-card Main Deck — same default as before.
+        // If they're on a non-deck tab (Extra/Combos/Test Hand), default to
+        // the primary 60-card Main Deck — not the 40-card variant — since
+        // that's the deck being built unless the user is actively looking
+        // at the variant tab.
         const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
-        const mainKey = onDeckTab
-            ? this.activeTab
-            : (this.decks.main40.length > 0 ? 'main40' : 'main60');
+        const mainKey = onDeckTab ? this.activeTab : 'main60';
         const mainCards = this.decks[mainKey];
         const extraCards = this.decks.extra;
 
