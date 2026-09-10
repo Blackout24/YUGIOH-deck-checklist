@@ -1230,6 +1230,89 @@ class YugiohPlugin extends Plugin {
 const RARITY_COLOR = { UR: '#e8c84a', SR: '#c084f5', R: '#60a5fa', N: '#94a3b8' };
 const RARITY_LABEL = { UR: '◆ UR', SR: '◇ SR', R: '● R', N: '○ N' };
 
+// ─── Deck Analysis: heuristic card-role classification ──────────────────────
+// No manual tagging — a card's role is inferred purely from its type + effect
+// text via keyword heuristics. This is a rough approximation of real deck-
+// building theory, not a rules engine, and is shown as such in the UI:
+//   Starter  — usable from an empty board/hand alone; gets the combo going
+//              (self-summons, searches a card, draws cards).
+//   Extender — picks up where a starter left off by recurring or re-using a
+//              resource (GY effects, on-destruction triggers, GY revival).
+//   Brick    — dead or low-value alone (vanilla monsters, equip spells that
+//              need a monster already down).
+//   Other    — doesn't clearly match any of the above (hand traps, generic
+//              removal, staples) — shown separately rather than forced in.
+// NOTE: every pattern below is matched with plain (non-multiline) regexes
+// against a single lowercased desc string, never split into per-line
+// sections — an earlier feature attempt broke by using `$` with the `m` flag
+// on a multi-line capture, which matches end-of-LINE instead of end-of-
+// string and silently truncates after the first line. Nothing here spans
+// lines, so that failure mode doesn't apply.
+const ROLE_META = {
+    starter: { label: '🟢 Starter', color: '#4ade80' },
+    extender: { label: '🔵 Extender', color: '#60a5fa' },
+    brick: { label: '🟤 Brick', color: '#a8a29e' },
+    other: { label: '⚪ Other', color: '#94a3b8' },
+};
+
+function classifyCardRole(card) {
+    const type = card.type || '';
+    const desc = (card.desc || '').toLowerCase();
+    const isMonster = type.includes('Monster');
+    const isExtraDeck = /Fusion|Synchro|XYZ|Xyz|Link/.test(type);
+
+    // Extra Deck monsters are never drawn into an opening hand — the
+    // starter/extender/brick concept (which is about hand quality) doesn't
+    // apply to them.
+    if (isExtraDeck) {
+        return { role: 'other', reason: 'Extra Deck monster — not part of opening-hand odds.' };
+    }
+
+    // Known hand traps — disruption, not a combo starter/extender/brick.
+    if (HAND_TRAPS.includes(card.name)) {
+        return { role: 'other', reason: 'Hand trap — disruption, not a combo piece.' };
+    }
+
+    // ── Brick checks ────────────────────────────────────────────────────────
+    if (isMonster && type.includes('Normal') && !type.includes('Effect')) {
+        return { role: 'brick', reason: 'Vanilla Normal Monster — no effect, dead card alone.' };
+    }
+    if (type.includes('Equip Spell') && !desc.includes('add') && !desc.includes('special summon')) {
+        return { role: 'brick', reason: 'Equip Spell — needs a monster already on board to do anything.' };
+    }
+
+    // ── Starter checks ──────────────────────────────────────────────────────
+    const starterPatterns = [
+        /special summon this card \(from your hand\)/,
+        /you can special summon this card from your hand/,
+        /can be special summoned.*from your hand/,
+        /add 1 .*from your deck to your hand/,
+        /add .*from your deck or gy to your hand/,
+        /draw 2 cards/,
+        /you can only activate this card if you control no other cards/,
+        /if you control no other cards, you can/,
+        /special summon 1 .*from your hand/,
+    ];
+    if (starterPatterns.some(re => re.test(desc))) {
+        return { role: 'starter', reason: 'Searches, draws, or self-summons — usable from an empty board.' };
+    }
+
+    // ── Extender checks ─────────────────────────────────────────────────────
+    const extenderPatterns = [
+        /special summon this card from your (hand or )?graveyard/,
+        /you can banish this card from your graveyard/,
+        /if this card is (sent to the graveyard|destroyed)/,
+        /when this card is (sent to the graveyard|destroyed)/,
+        /shuffle this card into the deck.*special summon/,
+        /special summon 1 .*from your graveyard/,
+    ];
+    if (extenderPatterns.some(re => re.test(desc))) {
+        return { role: 'extender', reason: 'Recurs or extends from the Graveyard — picks up after a starter.' };
+    }
+
+    return { role: 'other', reason: "Doesn't clearly match Starter/Extender/Brick patterns — generic effect." };
+}
+
 class DeckUI extends Modal {
     constructor(app, plugin) {
         super(app);
@@ -1240,6 +1323,7 @@ class DeckUI extends Modal {
         this.comboCardCache = new Map(); // name.toLowerCase() → card object
         this.collectionMap = new Map(); // name.toLowerCase() → { count, rarity } from the collection note
         this.activeTab = 'main60';
+        this.analysisDeck = null; // resolved lazily on first visit to the Analysis tab
         this.loading = false;
     }
 
@@ -1309,9 +1393,19 @@ class DeckUI extends Modal {
 
         // ── Tab bar ─────────────────────────────────────────────────────────
         const tabBar = contentEl.createEl('div');
+        tabBar.classList.add('yugioh-tabbar-scroll');
         tabBar.style.cssText = `
-            display: flex; gap: 0; flex-shrink: 0;
+            display: flex; gap: 0; flex-shrink: 0; overflow-x: auto; overflow-y: hidden;
             background: #0d0f1a; border-bottom: 2px solid #1f2937;
+        `;
+        // Thin, theme-matching scrollbar for the tab bar (Chromium/Electron —
+        // Obsidian's renderer) so overflowing tabs (e.g. Analysis on a narrow
+        // window) are reachable by scroll instead of just clipped off-screen.
+        const tabBarScrollStyle = contentEl.createEl('style');
+        tabBarScrollStyle.textContent = `
+            .yugioh-tabbar-scroll::-webkit-scrollbar { height: 5px; }
+            .yugioh-tabbar-scroll::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+            .yugioh-tabbar-scroll::-webkit-scrollbar-track { background: transparent; }
         `;
 
         const TABS = [
@@ -1320,6 +1414,7 @@ class DeckUI extends Modal {
             { key: 'extra', label: '🟥 Extra Deck', color: '#f87171' },
             { key: 'combos', label: '🧠 Combos', color: '#a78bfa' },
             { key: 'hand', label: '🎲 Test Hand', color: '#e8c84a' },
+            { key: 'analysis', label: '📈 Analysis', color: '#f472b6' },
         ];
         this.tabEls = {};
         for (const tab of TABS) {
@@ -1328,8 +1423,8 @@ class DeckUI extends Modal {
             btn.dataset.tabKey = tab.key;
             btn.style.cssText = `
                 background: none; border: none; border-bottom: 3px solid transparent;
-                padding: 9px 18px; color: #6b7280; cursor: pointer;
-                font-size: 0.82em; font-weight: bold; font-family: monospace;
+                padding: 9px 14px; color: #6b7280; cursor: pointer; flex: 0 0 auto;
+                font-size: 0.8em; font-weight: bold; font-family: monospace;
                 transition: color .15s, border-color .15s; white-space: nowrap;
             `;
             btn.onmouseenter = () => { if (this.activeTab !== tab.key) btn.style.color = '#e2e8f0'; };
@@ -1545,6 +1640,7 @@ class DeckUI extends Modal {
             extra: '🟥 Extra Deck',
             combos: '🧠 Combos',
             hand: '🎲 Test Hand',
+            analysis: '📈 Analysis',
         };
         // Update tab button styles
         for (const [k, { btn, color }] of Object.entries(this.tabEls)) {
@@ -1575,6 +1671,9 @@ class DeckUI extends Modal {
         } else if (key === 'hand') {
             this.grid.style.display = 'block';
             this.renderHandSimulator(this.grid);
+        } else if (key === 'analysis') {
+            this.grid.style.display = 'block';
+            this.renderAnalysis(this.grid);
         } else {
             this.grid.style.display = 'grid';
             const cards = this.decks[key] || [];
@@ -2562,6 +2661,111 @@ class DeckUI extends Modal {
     }
 
     onClose() { this.contentEl.empty(); }
+
+    // ── Deck Analysis ────────────────────────────────────────────────────────
+    // Heuristic Starter/Extender/Brick/Other breakdown (see classifyCardRole
+    // near the top of the file). Percentages are copies-weighted (×N counts),
+    // matching how often you'd actually draw each role — not just unique-card
+    // counts. Extra Deck is excluded (see classifyCardRole).
+    renderAnalysis(container) {
+        if (!this.analysisDeck) {
+            this.analysisDeck = this.decks.main40.length > 0 ? 'main40' : 'main60';
+        }
+
+        const controls = container.createEl('div');
+        controls.style.cssText = 'display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center;';
+
+        const mkToggle = (label, key) => {
+            const b = controls.createEl('button');
+            b.textContent = label;
+            const active = this.analysisDeck === key;
+            b.style.cssText = `
+                background: ${active ? '#f472b622' : '#1f2937'}; color: ${active ? '#f472b6' : '#6b7280'};
+                border: 1px solid ${active ? '#f472b6' : '#374151'};
+                padding: 6px 13px; border-radius: 6px; cursor: pointer;
+                font-size: 0.8em; font-family: monospace; font-weight: bold;
+            `;
+            b.onclick = () => {
+                this.analysisDeck = key;
+                container.empty();
+                this.renderAnalysis(container);
+            };
+            return b;
+        };
+        mkToggle('🟦 Main Deck (60)', 'main60');
+        mkToggle('🟢 40-Card Variant', 'main40');
+
+        const note = controls.createEl('span');
+        note.textContent = '🔍 Heuristic estimate from card text — not exact, use as a rough guide.';
+        note.style.cssText = 'font-size: 0.7em; color: #6b7280; font-family: monospace; margin-left: auto;';
+
+        const cards = this.decks[this.analysisDeck] || [];
+        if (cards.length === 0) {
+            const empty = container.createEl('div');
+            empty.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.85em; padding: 30px; text-align: center;';
+            empty.textContent = `No cards loaded in ${this.analysisDeck === 'main40' ? 'the 40-Card Variant' : 'Main Deck'} yet.`;
+            return;
+        }
+
+        const buckets = { starter: [], extender: [], brick: [], other: [] };
+        let totalCopies = 0;
+        for (const card of cards) {
+            const { role, reason } = classifyCardRole(card);
+            const copies = card.count || 1;
+            totalCopies += copies;
+            buckets[role].push({ card, copies, reason });
+        }
+
+        // ── Percentage bars ──────────────────────────────────────────────────
+        const barsWrap = container.createEl('div');
+        barsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;';
+        for (const role of ['starter', 'extender', 'brick', 'other']) {
+            const items = buckets[role];
+            const copies = items.reduce((n, i) => n + i.copies, 0);
+            const pct = totalCopies > 0 ? Math.round((copies / totalCopies) * 100) : 0;
+            const meta = ROLE_META[role];
+
+            const row = barsWrap.createEl('div');
+            const labelRow = row.createEl('div');
+            labelRow.style.cssText = 'display: flex; justify-content: space-between; font-family: monospace; font-size: 0.82em; color: #cbd5e1; margin-bottom: 4px;';
+            labelRow.createEl('span', { text: meta.label });
+            labelRow.createEl('span', { text: `${copies} cards · ${pct}%` });
+
+            const barBg = row.createEl('div');
+            barBg.style.cssText = 'height: 10px; background: #1f2937; border-radius: 5px; overflow: hidden;';
+            const barFill = barBg.createEl('div');
+            barFill.style.cssText = `height: 100%; width: ${pct}%; background: ${meta.color}; border-radius: 5px; transition: width .4s;`;
+        }
+
+        // ── Per-card breakdown ───────────────────────────────────────────────
+        for (const role of ['starter', 'extender', 'brick', 'other']) {
+            const items = buckets[role];
+            if (items.length === 0) continue;
+            const meta = ROLE_META[role];
+
+            const section = container.createEl('div');
+            section.style.cssText = 'margin-bottom: 16px;';
+            const header = section.createEl('div');
+            header.textContent = meta.label;
+            header.style.cssText = `
+                font-family: monospace; font-size: 0.78em; font-weight: bold; color: ${meta.color};
+                text-transform: uppercase; letter-spacing: 0.08em; padding-bottom: 6px;
+                border-bottom: 1px solid #1f2937; margin-bottom: 8px;
+            `;
+
+            for (const { card, copies, reason } of items) {
+                const line = section.createEl('div');
+                line.style.cssText = 'display: flex; justify-content: space-between; gap: 10px; padding: 4px 2px; font-family: monospace; font-size: 0.78em;';
+                const nameSpan = line.createEl('span');
+                nameSpan.style.cssText = 'color: #e2e8f0; white-space: nowrap;';
+                nameSpan.textContent = `${card.name} ×${copies}`;
+                nameSpan.title = reason;
+                const reasonSpan = line.createEl('span');
+                reasonSpan.style.cssText = 'color: #6b7280; text-align: right; max-width: 55%;';
+                reasonSpan.textContent = reason;
+            }
+        }
+    }
 
     confirmApplyTemplate() {
         const file = this.plugin.getActiveFile();
