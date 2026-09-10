@@ -1226,6 +1226,63 @@ class YugiohPlugin extends Plugin {
         }
     }
 
+    // Advanced Search — combines whichever filters the user filled in
+    // (name is fuzzy via YGOPRODeck's `fname`, everything else maps to its
+    // own query param) into one API call, then applies the Master Duel
+    // rarity filter client-side since rarity isn't something the API knows
+    // about (it's resolved the same way fetchCard/fetchCardCandidates do).
+    async searchCards(filters, _retried = false) {
+        const params = new URLSearchParams();
+        if (filters.name) params.set('fname', filters.name.trim());
+        if (filters.type) params.set('type', filters.type);
+        if (filters.attribute) params.set('attribute', filters.attribute);
+        if (filters.level) params.set('level', String(filters.level));
+        if (filters.archetype) params.set('archetype', filters.archetype.trim());
+        params.set('misc', 'yes');
+        params.set('num', '40');
+        params.set('offset', '0');
+
+        const realFilterKeys = ['fname', 'type', 'attribute', 'level', 'archetype'];
+        const hasRealFilter = realFilterKeys.some(k => params.has(k)) || filters.rarity;
+        if (!hasRealFilter) {
+            return { error: 'Enter at least one filter (name, type, attribute, level, archetype, or rarity).' };
+        }
+
+        try {
+            const res = await fetch(`https://db.ygoprodeck.com/api/v7/cardinfo.php?${params.toString()}`);
+            if (!res.ok) {
+                if (res.status === 429 && !_retried) {
+                    await new Promise(r => setTimeout(r, 600));
+                    return this.searchCards(filters, true);
+                }
+                if (res.status === 400) return { results: [] }; // API's "no match" response
+                return { error: `Search failed (HTTP ${res.status}).` };
+            }
+            const data = await res.json();
+            if (!data.data || data.data.length === 0) return { results: [] };
+
+            let results = data.data.map(c => ({
+                name: c.name, type: c.type, atk: c.atk, def: c.def,
+                level: c.level ?? c.linkval, attribute: c.attribute, race: c.race,
+                desc: c.desc, image: c.card_images[0].image_url,
+                archetype: c.archetype,
+                ban_tcg: c.banlist_info?.ban_tcg || 'Unlimited',
+                konami_id: c.misc_info?.[0]?.konami_id,
+                ban_md: this.getBanStatusMD(c.misc_info?.[0]?.konami_id),
+                rarity: this.rarityDB[c.name] || this.normalizeMdRarity(c.misc_info?.[0]?.md_rarity) || this.getRarity(c),
+                frameType: c.frameType
+            }));
+
+            if (filters.rarity) {
+                results = results.filter(c => c.rarity === filters.rarity);
+            }
+            return { results };
+        } catch (err) {
+            console.error('[YugiohPlugin] searchCards error:', err);
+            return { error: 'Network error while searching.' };
+        }
+    }
+
     getRarity(card) {
         if (card.type.includes('Fusion') || card.type.includes('Link')) return 'UR';
         if (card.type.includes('Effect')) return 'SR';
@@ -1486,14 +1543,8 @@ class DeckUI extends Modal {
             if (!name) return new Notice('Enter a card name.');
             if (this.loading) return;
 
-            const group = this.activeTab;
-            if (!this.decks[group]) {
-                return new Notice(`Switch to Main Deck, 40-Card Variant, or Extra Deck to add cards (not "${group}").`);
-            }
-
             this.loading = true; addBtn.disabled = true;
             this.setStatus(`Fetching "${name}"…`);
-
             const fetched = await this.plugin.fetchCard(name);
             this.loading = false; addBtn.disabled = false;
 
@@ -1502,28 +1553,13 @@ class DeckUI extends Modal {
                 return new Notice(`Card not found: "${name}"`);
             }
 
-            // Stack onto an existing entry for the same card in this section
-            // instead of adding a second tile for it.
-            const existing = this.decks[group].find(c => c.name.toLowerCase() === fetched.name.toLowerCase());
-            let entry;
-            if (existing) {
-                existing.count = (existing.count || 1) + 1;
-                existing.owned = true;
-                entry = existing;
-            } else {
-                fetched.owned = true;
-                fetched.count = 1;
-                fetched.deckGroup = group;
-                this.decks[group].push(fetched);
-                this.allCards.push(fetched);
-                entry = fetched;
-            }
-
-            this.switchTab(group); // re-render from this.decks so counts/tiles stay in sync
-            this.setStatus(`✅ "${entry.name}" [${entry.rarity}] ×${entry.count} in ${group} — saving…`);
-            input.value = '';
-            await this.saveCardToTemplate(entry);
+            const added = await this.addFetchedCardToDeck(fetched);
+            if (added) input.value = '';
         };
+
+        const searchBtn = this.makeBtn(searchRow, '🔎 Search', '#8b5cf6', '#fff');
+        searchBtn.title = 'Advanced search — type, attribute, level, archetype, rarity';
+        searchBtn.onclick = () => new CardSearchUI(this.app, this.plugin, this).open();
 
         loadBtn.onclick = async () => {
             this.collectionMap = await this.plugin.loadCollectionMap();
@@ -1551,6 +1587,37 @@ class DeckUI extends Modal {
         btn.onmouseenter = () => btn.style.opacity = '0.75';
         btn.onmouseleave = () => btn.style.opacity = '1';
         return btn;
+    }
+
+    // Shared by the exact-name "＋ Add" flow and CardSearchUI's result tiles —
+    // both end up with an already-fetched card object and just need it
+    // stacked into the active deck tab and saved. Returns false (with a
+    // Notice) if the active tab isn't a real deck group, so callers can tell
+    // whether the add actually happened.
+    async addFetchedCardToDeck(fetched) {
+        const group = this.activeTab;
+        if (!this.decks[group]) {
+            new Notice(`Switch to Main Deck, 40-Card Variant, or Extra Deck to add cards (not "${group}").`);
+            return false;
+        }
+
+        const existing = this.decks[group].find(c => c.name.toLowerCase() === fetched.name.toLowerCase());
+        let entry;
+        if (existing) {
+            existing.count = (existing.count || 1) + 1;
+            existing.owned = true;
+            entry = existing;
+        } else {
+            const copy = { ...fetched, owned: true, count: 1, deckGroup: group };
+            this.decks[group].push(copy);
+            this.allCards.push(copy);
+            entry = copy;
+        }
+
+        this.switchTab(group); // re-render from this.decks so counts/tiles stay in sync
+        this.setStatus(`✅ "${entry.name}" [${entry.rarity}] ×${entry.count} in ${group} — saving…`);
+        await this.saveCardToTemplate(entry);
+        return true;
     }
 
     // Extract every word/phrase from combo texts that could be a card name,
@@ -3246,6 +3313,203 @@ class YugiohSettingTab extends PluginSettingTab {
                     this.display();
                 })
             );
+    }
+}
+
+// Advanced Search — filter by type/attribute/level/archetype/rarity instead
+// of the toolbar's exact-name lookup. Opened from the Deck Builder toolbar;
+// clicking a result tile adds it to whichever deck tab was active when the
+// search modal was opened (via deckUI.addFetchedCardToDeck), and the modal
+// stays open so several cards can be added from one search.
+class CardSearchUI extends Modal {
+    constructor(app, plugin, deckUI) {
+        super(app);
+        this.plugin = plugin;
+        this.deckUI = deckUI;
+        this.loading = false;
+    }
+
+    onOpen() {
+        this.modalEl.style.width = '760px';
+        this.modalEl.style.maxWidth = '95vw';
+        this.modalEl.style.maxHeight = '88vh';
+
+        const { contentEl } = this;
+        contentEl.style.cssText = `
+            background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif;
+            padding: 0; overflow: hidden; display: flex; flex-direction: column; height: 78vh;
+        `;
+
+        const header = contentEl.createEl('div');
+        header.style.cssText = `
+            background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%);
+            padding: 16px 24px 12px; border-bottom: 2px solid #8b5cf644; flex-shrink: 0;
+        `;
+        const title = header.createEl('h1');
+        title.textContent = '🔎 Advanced Search';
+        title.style.cssText = `
+            margin: 0 0 3px; font-size: 1.3em; font-weight: bold;
+            background: linear-gradient(90deg, #a78bfa, #f5c3ff);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        `;
+        const sub = header.createEl('p');
+        sub.style.cssText = 'margin: 0; font-size: 0.72em; color: #94a3b8; font-family: monospace;';
+        sub.textContent = `Adding to: ${this.deckUI?.decks?.[this.deckUI?.activeTab] ? this.deckUI.activeTab : '— switch to a deck tab first —'}`;
+
+        // ── Filter form ─────────────────────────────────────────────────────
+        const form = contentEl.createEl('div');
+        form.style.cssText = `
+            display: flex; gap: 8px; padding: 12px 20px; background: #111827;
+            border-bottom: 1px solid #1f2937; flex-shrink: 0; flex-wrap: wrap; align-items: center;
+        `;
+
+        const fieldStyle = `
+            background: #1f2937; border: 1px solid #374151; border-radius: 6px;
+            padding: 7px 10px; color: #e2e8f0; font-size: 0.82em; outline: none;
+            font-family: monospace;
+        `;
+
+        const nameInput = form.createEl('input');
+        nameInput.placeholder = 'Name contains…';
+        nameInput.style.cssText = fieldStyle + 'flex: 1.4; min-width: 130px;';
+
+        const typeSelect = form.createEl('select');
+        typeSelect.style.cssText = fieldStyle + 'flex: 1; min-width: 110px;';
+        [
+            ['', 'Any type'], ['Effect Monster', 'Effect Monster'], ['Normal Monster', 'Normal Monster'],
+            ['Ritual Monster', 'Ritual Monster'], ['Fusion Monster', 'Fusion Monster'],
+            ['Synchro Monster', 'Synchro Monster'], ['XYZ Monster', 'Xyz Monster'],
+            ['Link Monster', 'Link Monster'], ['Pendulum Effect Monster', 'Pendulum Effect Monster'],
+            ['Spell Card', 'Spell Card'], ['Trap Card', 'Trap Card'],
+        ].forEach(([val, label]) => {
+            const opt = typeSelect.createEl('option');
+            opt.value = val; opt.textContent = label;
+        });
+
+        const attrSelect = form.createEl('select');
+        attrSelect.style.cssText = fieldStyle + 'flex: 0.7; min-width: 90px;';
+        ['', 'DARK', 'LIGHT', 'EARTH', 'WATER', 'FIRE', 'WIND', 'DIVINE'].forEach(val => {
+            const opt = attrSelect.createEl('option');
+            opt.value = val; opt.textContent = val || 'Any attribute';
+        });
+
+        const levelInput = form.createEl('input');
+        levelInput.type = 'number';
+        levelInput.min = '0'; levelInput.max = '13';
+        levelInput.placeholder = 'Level/Rank';
+        levelInput.style.cssText = fieldStyle + 'flex: 0.6; min-width: 80px;';
+
+        const archetypeInput = form.createEl('input');
+        archetypeInput.placeholder = 'Archetype…';
+        archetypeInput.style.cssText = fieldStyle + 'flex: 1; min-width: 110px;';
+
+        const raritySelect = form.createEl('select');
+        raritySelect.style.cssText = fieldStyle + 'flex: 0.6; min-width: 90px;';
+        ['', 'UR', 'SR', 'R', 'N'].forEach(val => {
+            const opt = raritySelect.createEl('option');
+            opt.value = val; opt.textContent = val ? `MD: ${val}` : 'Any rarity';
+        });
+
+        const searchBtn = form.createEl('button');
+        searchBtn.textContent = '🔎 Search';
+        searchBtn.style.cssText = `
+            background: #8b5cf6; color: #fff; border: none; padding: 7px 14px;
+            border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 0.82em;
+        `;
+
+        [nameInput, levelInput, archetypeInput].forEach(el => {
+            el.addEventListener('keydown', e => { if (e.key === 'Enter') searchBtn.click(); });
+        });
+
+        // ── Status + results ────────────────────────────────────────────────
+        const statusBar = contentEl.createEl('div');
+        statusBar.style.cssText = `
+            padding: 5px 22px; font-size: 0.72em; color: #6b7280;
+            background: #0d0f1a; flex-shrink: 0; font-family: monospace;
+            border-bottom: 1px solid #1f2937;
+        `;
+        statusBar.textContent = 'Set a filter and hit Search.';
+
+        const grid = contentEl.createEl('div');
+        grid.style.cssText = `
+            flex: 1; overflow-y: auto; padding: 16px 20px;
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+            gap: 10px; align-content: start;
+        `;
+
+        searchBtn.onclick = async () => {
+            if (this.loading) return;
+            const filters = {
+                name: nameInput.value, type: typeSelect.value, attribute: attrSelect.value,
+                level: levelInput.value, archetype: archetypeInput.value, rarity: raritySelect.value,
+            };
+            this.loading = true; searchBtn.disabled = true;
+            statusBar.textContent = 'Searching…';
+            grid.empty();
+
+            const { results, error } = await this.plugin.searchCards(filters);
+            this.loading = false; searchBtn.disabled = false;
+
+            if (error) {
+                statusBar.textContent = `❌ ${error}`;
+                return;
+            }
+            if (results.length === 0) {
+                statusBar.textContent = 'No cards matched those filters.';
+                return;
+            }
+            statusBar.textContent = `${results.length} result${results.length > 1 ? 's' : ''}${results.length === 40 ? ' (capped at 40 — narrow your filters for more)' : ''} — click a card to add it.`;
+            for (const card of results) this.renderResultTile(card, grid);
+        };
+    }
+
+    renderResultTile(card, container) {
+        const rarityColor = RARITY_COLOR[card.rarity] || '#94a3b8';
+
+        const wrap = container.createEl('div');
+        wrap.style.cssText = `
+            display: flex; flex-direction: column; align-items: center;
+            background: #111827; border-radius: 8px; padding: 8px 5px 9px;
+            border: 1.5px solid ${rarityColor}77; cursor: pointer;
+            transition: transform .15s, border-color .15s;
+        `;
+        wrap.title = `${card.name}\n${card.type}\n${card.desc?.slice(0, 140) ?? ''}…\nClick to add`;
+
+        wrap.onmouseenter = () => { wrap.style.transform = 'scale(1.06)'; wrap.style.borderColor = rarityColor; };
+        wrap.onmouseleave = () => { wrap.style.transform = 'scale(1)'; wrap.style.borderColor = rarityColor + '77'; };
+
+        const img = wrap.createEl('img');
+        img.src = card.image;
+        img.style.cssText = 'width: 82px; border-radius: 4px; display: block; pointer-events: none;';
+
+        const nameEl = wrap.createEl('div');
+        nameEl.textContent = card.name.length > 17 ? card.name.slice(0, 15) + '…' : card.name;
+        nameEl.style.cssText = `
+            font-size: 0.6em; text-align: center; color: #cbd5e1;
+            margin-top: 5px; line-height: 1.3; max-width: 100px; font-family: monospace;
+        `;
+
+        const rarityEl = wrap.createEl('div');
+        rarityEl.textContent = RARITY_LABEL[card.rarity] || card.rarity;
+        rarityEl.style.cssText = `font-size: 0.58em; font-weight: bold; color: ${rarityColor}; margin-top: 2px; font-family: monospace;`;
+
+        const banStatus = card.ban_md || this.plugin.getBanStatusMD(card.konami_id);
+        if (banStatus && banStatus !== 'Unlimited') {
+            const banEl = wrap.createEl('div');
+            banEl.textContent = `⚠ MD: ${banStatus}`;
+            banEl.style.cssText = 'font-size: 0.54em; color: #f87171; margin-top: 2px; font-family: monospace;';
+        }
+
+        wrap.onclick = async () => {
+            if (!this.deckUI) {
+                return new Notice('Open this search from the Deck Builder to add cards.');
+            }
+            const added = await this.deckUI.addFetchedCardToDeck(card);
+            if (added) {
+                wrap.style.borderColor = '#4ade80';
+                setTimeout(() => { wrap.style.borderColor = rarityColor + '77'; }, 400);
+            }
+        };
     }
 }
 
