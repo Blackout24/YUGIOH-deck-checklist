@@ -1297,14 +1297,30 @@ function classifyCardRole(card) {
         return { role: 'starter', reason: 'Searches, draws, or self-summons — usable from an empty board.' };
     }
 
-    // ── Extender checks ─────────────────────────────────────────────────────
+    // ── Extender checks ──────────────────────────────────────────────────────
+    // NOTE: real card text (and ygoprodeck's desc field) abbreviates Graveyard
+    // as "GY", not spelled out — e.g. Dragonmaid Tidying reads "You can banish
+    // this card from your GY; Special Summon...". Every pattern below matches
+    // "gy" (with "graveyard" also tolerated defensively, since some
+    // third-party sources spell it out) — an earlier version of this file
+    // only matched "graveyard", which meant these patterns effectively never
+    // fired against real card text and everything GY-reliant fell into
+    // "Other" instead of "Extender".
+    const GY = '(?:gy|graveyard)';
     const extenderPatterns = [
-        /special summon this card from your (hand or )?graveyard/,
-        /you can banish this card from your graveyard/,
-        /if this card is (sent to the graveyard|destroyed)/,
-        /when this card is (sent to the graveyard|destroyed)/,
-        /shuffle this card into the deck.*special summon/,
-        /special summon 1 .*from your graveyard/,
+        new RegExp(`special summon this card from your (?:hand or )?${GY}`),
+        new RegExp(`you can banish this card from your ${GY}`),
+        new RegExp(`if this card is (?:sent to the ${GY}|destroyed)`),
+        new RegExp(`when this card is (?:sent to the ${GY}|destroyed)`),
+        new RegExp(`shuffle this card into the deck.*special summon`),
+        new RegExp(`special summon 1 .*from your ${GY}`),
+        // Self-recursion from the GY back to hand (e.g. Dragonmaid Changeover:
+        // "While this card is in your GY: ... add this card to your hand").
+        new RegExp(`add this card to your hand`),
+        // Generic revival spells/traps phrased as "target 1 monster in
+        // (either|your) GY; Special Summon it" (e.g. Monster Reborn) rather
+        // than "Special Summon ... from your GY".
+        new RegExp(`target 1 monster in (?:either|your) ${GY}.*special summon`),
     ];
     if (extenderPatterns.some(re => re.test(desc))) {
         return { role: 'extender', reason: 'Recurs or extends from the Graveyard — picks up after a starter.' };
