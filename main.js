@@ -2,7 +2,15 @@
 
 const HAND_TRAPS = [
     'Ash Blossom & Joyous Spring', 'Maxx "C"', 'Effect Veiler',
-    'Nibiru, the Primal Being', 'Droll & Lock Bird', 'Ghost Ogre & Snow Rabbit'
+    'Nibiru, the Primal Being', 'Droll & Lock Bird', 'Ghost Ogre & Snow Rabbit',
+    'Ghost Belle & Haunted Mansion',
+    // Non-monster staples that function as instant-speed disruption rather
+    // than combo pieces. Not "hand traps" in the strict monster sense, but
+    // classifyCardRole treats this list as "disruption, not a combo piece"
+    // (see its comment above), and these belong in that bucket too — without
+    // this they fell through to the generic "Other" catch-all instead.
+    'Infinite Impermanence', 'Called by the Grave', 'Torrential Tribute',
+    'Crossout Designator', 'Solemn Judgment', 'Compulsory Evacuation Device',
 ];
 
 // The rarity DB used to live here as a hardcoded object. It's now shipped as
@@ -1268,9 +1276,10 @@ function classifyCardRole(card) {
         return { role: 'other', reason: 'Extra Deck monster — not part of opening-hand odds.' };
     }
 
-    // Known hand traps — disruption, not a combo starter/extender/brick.
+    // Known hand traps and hand-trap-style staple disruption (see HAND_TRAPS
+    // comment) — disruption, not a combo starter/extender/brick.
     if (HAND_TRAPS.includes(card.name)) {
-        return { role: 'other', reason: 'Hand trap — disruption, not a combo piece.' };
+        return { role: 'other', reason: 'Disruption/negation staple — not a combo piece.' };
     }
 
     // ── Brick checks ────────────────────────────────────────────────────────
