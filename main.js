@@ -34,7 +34,7 @@ const BANLIST_SOURCE_URL = 'https://dawnbrandbots.github.io/yaml-yugi-limit-regu
 // offline stretch doesn't go unnoticed.
 const BANLIST_STALE_DAYS = 30;
 
-const DEFAULT_SETTINGS = {};
+const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md' };
 
 // ── Shared line/section helpers ──────────────────────────────────────────────
 // Recognizes both checkbox styles: "- [ ]"/"- [x]" and "- ☐"/"- ☑".
@@ -515,6 +515,101 @@ function decrementCardInTemplate(content, cardName, deckGroup) {
     return { content: lines.join(eol), removed: false, newCount };
 }
 
+// ── Collection note (owned-card tracking, independent of any deck) ────────
+// Unlike deck notes, the collection note is a flat list — no deck-group or
+// Monster/Spell/Trap sections, just "- Card Name ×N [RARITY]" lines anywhere
+// in the file (rarity tag optional, defaults to N). Grouping by rarity for
+// display happens in the UI, not the file structure, so this reuses
+// CARD_LINE_RE/parseEntryText directly with no heading-tracking needed.
+
+// Parses every card line in a collection note into a Map keyed by lowercase
+// name. If the same card appears on more than one line, counts are summed
+// and a real rarity tag (if any) wins over a missing/default one.
+function parseCollectionFromMarkdown(content) {
+    const lines = splitLines(content);
+    const map = new Map();
+    for (const line of lines) {
+        if (!isCardLine(line)) continue;
+        const m = line.match(CARD_LINE_RE);
+        const { name, count, rarity } = parseEntryText(m[2]);
+        if (!name || name.length < 2) continue;
+        const key = name.toLowerCase();
+        if (map.has(key)) {
+            const existing = map.get(key);
+            existing.count += count;
+            if (existing.rarity === 'N' && rarity && rarity !== 'N') existing.rarity = rarity;
+        } else {
+            map.set(key, { name, count, rarity: rarity || 'N' });
+        }
+    }
+    return map;
+}
+
+// Rewrites a card's line to the given count if it already exists anywhere
+// in the collection note, otherwise appends a new line right after the last
+// existing card line (or at the end of the file if there are none yet).
+function upsertCollectionCard(content, cardName, rarity, count) {
+    const eol = detectEOL(content);
+    const lines = splitLines(content);
+    const target = cardName.trim().toLowerCase();
+    let lastCardIdx = -1;
+
+    for (let i = 0; i < lines.length; i++) {
+        if (!isCardLine(lines[i])) continue;
+        lastCardIdx = i;
+        const m = lines[i].match(CARD_LINE_RE);
+        const { name } = parseEntryText(m[2]);
+        if (name.toLowerCase() !== target) continue;
+        lines[i] = `- ${cardName} ×${count} [${rarity || 'N'}]`;
+        return lines.join(eol);
+    }
+
+    const newLine = `- ${cardName} ×${count} [${rarity || 'N'}]`;
+    if (lastCardIdx !== -1) {
+        lines.splice(lastCardIdx + 1, 0, newLine);
+        return lines.join(eol);
+    }
+    const trimmed = content.replace(/\s+$/, '');
+    return `${trimmed}${eol}${newLine}${eol}`;
+}
+
+// Removes ONE copy of a card anywhere in the collection note — decrements
+// ×N, or deletes the line once the last copy is gone. Same
+// { content, removed, newCount } shape as decrementCardInTemplate.
+function decrementCollectionCard(content, cardName) {
+    const eol = detectEOL(content);
+    const lines = splitLines(content);
+    const target = cardName.trim().toLowerCase();
+
+    const idx = lines.findIndex(line => {
+        if (!isCardLine(line)) return false;
+        const m = line.match(CARD_LINE_RE);
+        const { name } = parseEntryText(m[2]);
+        return name.toLowerCase() === target;
+    });
+
+    if (idx === -1) return { content, removed: false, newCount: 0 };
+
+    const m = lines[idx].match(CARD_LINE_RE);
+    const { name, count, rarity } = parseEntryText(m[2]);
+    const newCount = count - 1;
+
+    if (newCount <= 0) {
+        lines.splice(idx, 1);
+        return { content: lines.join(eol), removed: true, newCount: 0 };
+    }
+
+    lines[idx] = `- ${name} ×${newCount} [${rarity}]`;
+    return { content: lines.join(eol), removed: false, newCount };
+}
+
+const COLLECTION_TEMPLATE = `# 📦 MY COLLECTION
+> Every card you own, one line each — "- Card Name ×3 [UR]". Rarity tag is optional (defaults to N). Edit directly, or use the "📦 Open Collection Manager" command to add/remove cards from the UI.
+
+---
+
+`;
+
 const DECK_TEMPLATE = `# 🐉 Deck Template – Master Duel (Obsidian)
 > Reusable Obsidian template for decks in Master Duel. Clean version with no cards, ready to customize.
 
@@ -691,6 +786,21 @@ class YugiohPlugin extends Plugin {
             id: 'create-deck-template',
             name: '📄 Create Deck Template in Templates folder',
             callback: () => this.createDeckTemplate()
+        });
+        this.addCommand({
+            id: 'open-collection-ui',
+            name: '📦 Open Collection Manager',
+            callback: () => new CollectionUI(this.app, this).open()
+        });
+        this.addCommand({
+            id: 'open-collection-note',
+            name: '📦 Open Collection Note (edit directly)',
+            callback: () => this.openCollectionNote()
+        });
+        this.addCommand({
+            id: 'create-collection-note',
+            name: '📦 Create Collection Note',
+            callback: () => this.createCollectionNote()
         });
         this.addCommand({
             id: 'reload-yugioh-data-files',
@@ -884,6 +994,72 @@ class YugiohPlugin extends Plugin {
         return true;
     }
 
+    // ── Collection note I/O ────────────────────────────────────────────────
+    // Unlike deck notes (which use whatever file is currently open), the
+    // collection is a single fixed note at settings.collectionNotePath, so
+    // it's readable/writable regardless of what the user has open.
+    getCollectionFile() {
+        const file = this.app.vault.getAbstractFileByPath(this.settings.collectionNotePath);
+        return file instanceof TFile ? file : null;
+    }
+
+    async readCollection() {
+        const file = this.getCollectionFile();
+        if (!file) return null;
+        return await this.app.vault.read(file);
+    }
+
+    async writeCollection(content) {
+        const file = this.getCollectionFile();
+        if (!file) return false;
+        await this.app.vault.modify(file, content);
+        return true;
+    }
+
+    // Lightweight parse of the collection note (name/count/rarity only, no
+    // YGOPRODeck fetch) for cross-referencing "have vs need" in the Deck
+    // Builder without slowing deck loads down. Returns an empty Map if no
+    // collection note exists yet.
+    async loadCollectionMap() {
+        const content = await this.readCollection();
+        if (content === null) return new Map();
+        return parseCollectionFromMarkdown(content);
+    }
+
+    async createCollectionNote() {
+        const path = this.settings.collectionNotePath;
+        const vault = this.app.vault;
+        const existing = vault.getAbstractFileByPath(path);
+        try {
+            if (existing instanceof TFile) {
+                new Notice(`📦 Collection note already exists: ${path}`);
+            } else {
+                await vault.create(path, COLLECTION_TEMPLATE);
+                new Notice(`✅ Collection note created: ${path}`);
+            }
+            const file = vault.getAbstractFileByPath(path);
+            if (file instanceof TFile) {
+                await this.app.workspace.getLeaf(false).openFile(file);
+            }
+        } catch (err) {
+            new Notice(`❌ Failed to create collection note: ${err.message}`);
+        }
+    }
+
+    // Opens the collection note in the editor for direct manual editing —
+    // e.g. bulk-pasting a list, fixing a typo, or reordering — rather than
+    // going through the Collection Manager's click-to-add/remove UI one
+    // card at a time. Unlike createCollectionNote(), this never creates the
+    // file; it just tells you to if it's missing.
+    async openCollectionNote() {
+        const file = this.getCollectionFile();
+        if (!file) {
+            new Notice(`⚠️ No collection note at "${this.settings.collectionNotePath}" yet. Use "📦 Create Collection Note" first.`);
+            return;
+        }
+        await this.app.workspace.getLeaf(false).openFile(file);
+    }
+
     async createDeckTemplate() {
         const vault = this.app.vault;
         const templateFileName = 'Master Duel Deck Template.md';
@@ -1062,6 +1238,7 @@ class DeckUI extends Modal {
         this.allCards = [];
         this.combos = [];
         this.comboCardCache = new Map(); // name.toLowerCase() → card object
+        this.collectionMap = new Map(); // name.toLowerCase() → { count, rarity } from the collection note
         this.activeTab = 'main60';
         this.loading = false;
     }
@@ -1125,6 +1302,8 @@ class DeckUI extends Modal {
         const loadBtn = this.makeBtn(searchRow, '🔄 Reload', '#c084f5', '#fff');
         const statsBtn = this.makeBtn(searchRow, '📊 Stats', '#60a5fa', '#fff');
         const validateBtn = this.makeBtn(searchRow, '✅ Validate', '#4ade80', '#0d0f1a');
+        const craftBtn = this.makeBtn(searchRow, '📦 Craft List', '#f472b6', '#fff');
+        craftBtn.title = 'What you still need to craft, based on your Collection note';
         const applyTplBtn = this.makeBtn(searchRow, '🗋 Apply Template', '#1f2937', '#f87171');
         applyTplBtn.title = 'Overwrite the current note with the blank deck template';
 
@@ -1226,12 +1405,17 @@ class DeckUI extends Modal {
             await this.saveCardToTemplate(entry);
         };
 
-        loadBtn.onclick = () => this.loadFromTemplate();
+        loadBtn.onclick = async () => {
+            this.collectionMap = await this.plugin.loadCollectionMap();
+            await this.loadFromTemplate();
+        };
         statsBtn.onclick = () => this.showStats();
         validateBtn.onclick = () => this.showValidation();
+        craftBtn.onclick = () => this.showCraftList();
         applyTplBtn.onclick = () => this.confirmApplyTemplate();
 
         // Auto-load on open
+        this.collectionMap = await this.plugin.loadCollectionMap();
         await this.loadFromTemplate();
     }
 
@@ -2128,6 +2312,17 @@ class DeckUI extends Modal {
             banEl.style.cssText = 'font-size: 0.54em; color: #f87171; margin-top: 2px; font-family: monospace;';
         }
 
+        // Own-vs-need indicator, from the Collection note — only shown once
+        // a collection has actually been loaded, so an empty/missing
+        // collection doesn't paint every tile red.
+        if (this.collectionMap && this.collectionMap.size > 0) {
+            const have = this.collectionMap.get(card.name.toLowerCase())?.count || 0;
+            const need = card.count || 1;
+            const haveEl = wrap.createEl('div');
+            haveEl.textContent = `📦 ${have}/${need}`;
+            haveEl.style.cssText = `font-size: 0.54em; margin-top: 2px; font-family: monospace; color: ${have >= need ? '#4ade80' : '#f87171'};`;
+        }
+
         // Remove button (bottom-right) — removes ONE copy of this card from
         // this deck group (decrements ×N, or deletes the line once the last
         // copy is gone). Faint until hovered so it doesn't compete visually
@@ -2297,6 +2492,51 @@ class DeckUI extends Modal {
         new Notice(lines.join('\n'), 15000);
     }
 
+    // Cards this deck (Main + Extra, whichever main-deck view is active vs
+    // its 40/60 counterpart — matches validateDeck()'s mainKey logic) still
+    // needs beyond what the Collection note says is owned, grouped by
+    // rarity so it reads like a crafting shopping list.
+    showCraftList() {
+        if (this.allCards.length === 0) return new Notice('No cards loaded.');
+        if (!this.collectionMap || this.collectionMap.size === 0) {
+            return new Notice(`⚠️ No collection data loaded. Set up "${this.plugin.settings.collectionNotePath}" (Settings → 📦 Create Collection Note) first.`);
+        }
+
+        const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
+        const mainKey = onDeckTab ? this.activeTab : 'main60';
+        const cards = [...this.decks[mainKey], ...this.decks.extra];
+
+        const needed = new Map(); // name -> { need, rarity }
+        for (const c of cards) {
+            const prev = needed.get(c.name);
+            needed.set(c.name, { need: (prev?.need || 0) + (c.count || 1), rarity: c.rarity });
+        }
+
+        const missing = [];
+        const byRarity = { UR: 0, SR: 0, R: 0, N: 0 };
+        for (const [name, { need, rarity }] of needed) {
+            const have = this.collectionMap.get(name.toLowerCase())?.count || 0;
+            const short = need - have;
+            if (short > 0) {
+                missing.push(`${name} [${rarity}]  need ${short} more`);
+                byRarity[rarity in byRarity ? rarity : 'N'] += short;
+            }
+        }
+
+        if (missing.length === 0) {
+            return new Notice('✅ You already own every card in this deck!');
+        }
+
+        const lines = [
+            `📦 MISSING FROM COLLECTION (${missing.length} cards)`,
+            '─────────────────',
+            ...missing,
+            '',
+            `Crafting: ◆ UR ${byRarity.UR}  ◇ SR ${byRarity.SR}  ● R ${byRarity.R}  ○ N ${byRarity.N}`
+        ];
+        new Notice(lines.join('\n'), 20000);
+    }
+
     showStats() {
         if (this.allCards.length === 0) return new Notice('No cards loaded.');
         const total = this.allCards.length;
@@ -2378,6 +2618,329 @@ class DeckUI extends Modal {
     }
 }
 
+// Standalone collection browser: search/add cards, tabs by rarity, click a
+// tile to add a copy, ✕ to remove one — same interaction pattern as the
+// Deck Builder's card grid, but reading/writing the fixed collection note
+// instead of whatever file is currently open.
+class CollectionUI extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+        this.cards = [];
+        this.activeTab = 'UR';
+        this.loading = false;
+    }
+
+    async onOpen() {
+        this.modalEl.style.width = '820px';
+        this.modalEl.style.maxWidth = '95vw';
+        this.modalEl.style.maxHeight = '90vh';
+
+        const { contentEl } = this;
+        contentEl.style.cssText = `
+            background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif;
+            padding: 0; overflow: hidden; display: flex; flex-direction: column; height: 80vh;
+        `;
+
+        const header = contentEl.createEl('div');
+        header.style.cssText = `
+            background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%);
+            padding: 16px 24px 12px; border-bottom: 2px solid #e8c84a44; flex-shrink: 0;
+        `;
+        const title = header.createEl('h1');
+        title.textContent = '📦 Collection Manager';
+        title.style.cssText = `
+            margin: 0 0 3px; font-size: 1.35em; font-weight: bold;
+            background: linear-gradient(90deg, #e8c84a, #f5c3ff);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        `;
+        const sub = header.createEl('p');
+        sub.style.cssText = 'margin: 0; font-size: 0.72em; color: #94a3b8; font-family: monospace;';
+        sub.textContent = `📄 ${this.plugin.settings.collectionNotePath}  •  Click a card to add a copy, ✕ to remove one`;
+
+        const toolbar = contentEl.createEl('div');
+        toolbar.style.cssText = `
+            display: flex; gap: 8px; padding: 10px 20px; background: #111827;
+            border-bottom: 1px solid #1f2937; flex-shrink: 0; align-items: center; flex-wrap: wrap;
+        `;
+        const input = toolbar.createEl('input');
+        input.placeholder = 'Add card by exact name…';
+        input.style.cssText = `
+            flex: 1; min-width: 160px; background: #1f2937; border: 1px solid #374151;
+            border-radius: 6px; padding: 7px 12px; color: #e2e8f0; font-size: 0.88em;
+            outline: none; font-family: monospace;
+        `;
+        input.addEventListener('focus', () => input.style.borderColor = '#e8c84a');
+        input.addEventListener('blur', () => input.style.borderColor = '#374151');
+        const addBtn = this.makeBtn(toolbar, '＋ Add', '#e8c84a', '#0d0f1a');
+        const reloadBtn = this.makeBtn(toolbar, '🔄 Reload', '#c084f5', '#fff');
+        const openNoteBtn = this.makeBtn(toolbar, '📂 Open Note', '#1f2937', '#f87171');
+        openNoteBtn.title = 'Open the collection note directly for manual editing';
+
+        const statsBar = contentEl.createEl('div');
+        statsBar.style.cssText = `
+            padding: 8px 22px; font-size: 0.72em; color: #94a3b8; background: #0d0f1a;
+            flex-shrink: 0; font-family: monospace; border-bottom: 1px solid #1f2937;
+        `;
+        this.statsBar = statsBar;
+
+        const tabBar = contentEl.createEl('div');
+        tabBar.style.cssText = 'display: flex; gap: 0; flex-shrink: 0; background: #0d0f1a; border-bottom: 2px solid #1f2937;';
+        const TABS = [
+            { key: 'UR', label: '◆ UR', color: '#e8c84a' },
+            { key: 'SR', label: '◇ SR', color: '#c084f5' },
+            { key: 'R', label: '● R', color: '#60a5fa' },
+            { key: 'N', label: '○ N', color: '#94a3b8' },
+        ];
+        this.tabEls = {};
+        for (const tab of TABS) {
+            const btn = tabBar.createEl('button');
+            btn.textContent = tab.label;
+            btn.style.cssText = `
+                background: none; border: none; border-bottom: 3px solid transparent;
+                padding: 9px 18px; color: #6b7280; cursor: pointer; font-size: 0.82em;
+                font-weight: bold; font-family: monospace; transition: color .15s, border-color .15s;
+            `;
+            btn.onclick = () => this.switchTab(tab.key);
+            this.tabEls[tab.key] = { btn, color: tab.color };
+        }
+
+        const statusBar = contentEl.createEl('div');
+        statusBar.style.cssText = `
+            padding: 3px 22px; font-size: 0.7em; color: #6b7280; background: #0d0f1a;
+            flex-shrink: 0; font-family: monospace; border-bottom: 1px solid #1f2937;
+        `;
+        this.statusBar = statusBar;
+        this.setStatus('Loading collection…');
+
+        const grid = contentEl.createEl('div');
+        grid.style.cssText = `
+            flex: 1; overflow-y: auto; padding: 16px 20px; display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)); gap: 10px; align-content: start;
+        `;
+        this.grid = grid;
+
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') addBtn.click(); });
+        addBtn.onclick = async () => {
+            const name = input.value.trim();
+            if (!name) return new Notice('Enter a card name.');
+            if (this.loading) return;
+            this.loading = true; addBtn.disabled = true;
+            this.setStatus(`Fetching "${name}"…`);
+            const fetched = await this.plugin.fetchCard(name);
+            this.loading = false; addBtn.disabled = false;
+            if (!fetched) {
+                this.setStatus(`❌ Not found: "${name}"`);
+                return new Notice(`Card not found: "${name}"`);
+            }
+            const existing = this.cards.find(c => c.name.toLowerCase() === fetched.name.toLowerCase());
+            let entry;
+            if (existing) {
+                existing.count = (existing.count || 0) + 1;
+                entry = existing;
+            } else {
+                fetched.count = 1;
+                this.cards.push(fetched);
+                entry = fetched;
+            }
+            input.value = '';
+            this.switchTab(entry.rarity in this.tabEls ? entry.rarity : this.activeTab);
+            this.setStatus(`✅ "${entry.name}" [${entry.rarity}] ×${entry.count} — saving…`);
+            await this.saveCard(entry);
+            this.renderStats();
+        };
+        reloadBtn.onclick = () => this.loadCollection();
+        openNoteBtn.onclick = async () => {
+            await this.plugin.openCollectionNote();
+            this.close();
+        };
+
+        await this.loadCollection();
+    }
+
+    makeBtn(parent, label, bg, color) {
+        const btn = parent.createEl('button');
+        btn.textContent = label;
+        btn.style.cssText = `
+            background: ${bg}; color: ${color}; border: none; padding: 7px 13px;
+            border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 0.8em;
+            white-space: nowrap; transition: opacity .15s;
+        `;
+        btn.onmouseenter = () => btn.style.opacity = '0.75';
+        btn.onmouseleave = () => btn.style.opacity = '1';
+        return btn;
+    }
+
+    setStatus(msg) { if (this.statusBar) this.statusBar.textContent = msg; }
+
+    renderStats() {
+        if (!this.statsBar) return;
+        const copies = { UR: 0, SR: 0, R: 0, N: 0 };
+        const unique = { UR: 0, SR: 0, R: 0, N: 0 };
+        for (const c of this.cards) {
+            const r = c.rarity in copies ? c.rarity : 'N';
+            copies[r] += c.count || 0;
+            unique[r] += 1;
+        }
+        this.statsBar.textContent =
+            `◆ UR ${unique.UR} unique / ${copies.UR} copies   ` +
+            `◇ SR ${unique.SR} unique / ${copies.SR} copies   ` +
+            `● R ${unique.R} unique / ${copies.R} copies   ` +
+            `○ N ${unique.N} unique / ${copies.N} copies`;
+    }
+
+    switchTab(key) {
+        this.activeTab = key;
+        const LABELS = { UR: '◆ UR', SR: '◇ SR', R: '● R', N: '○ N' };
+        for (const [k, { btn, color }] of Object.entries(this.tabEls)) {
+            const active = k === key;
+            const count = this.cards.filter(c => (c.rarity in this.tabEls ? c.rarity : 'N') === k).length;
+            btn.textContent = count > 0 ? `${LABELS[k]} · ${count}` : LABELS[k];
+            btn.style.color = active ? color : '#6b7280';
+            btn.style.borderBottom = active ? `3px solid ${color}` : '3px solid transparent';
+            btn.style.background = active ? color + '18' : 'none';
+        }
+        this.grid.empty();
+        const cards = this.cards
+            .filter(c => (c.rarity in this.tabEls ? c.rarity : 'N') === key)
+            .sort((a, b) => a.name.localeCompare(b.name));
+        if (cards.length === 0) {
+            const empty = this.grid.createEl('div');
+            empty.style.cssText = `
+                color: #4b5563; font-family: monospace; font-size: 0.85em;
+                grid-column: 1 / -1; padding: 30px 0; text-align: center;
+            `;
+            empty.textContent = 'No cards in this rarity yet.';
+        } else {
+            for (const card of cards) this.renderCard(card, this.grid);
+        }
+    }
+
+    renderCard(card, container) {
+        const rarityColor = RARITY_COLOR[card.rarity] || '#94a3b8';
+        const wrap = container.createEl('div');
+        wrap.style.cssText = `
+            display: flex; flex-direction: column; align-items: center;
+            background: #111827; border-radius: 8px; padding: 8px 5px 9px;
+            border: 1.5px solid ${rarityColor}77; cursor: pointer;
+            transition: transform .15s; position: relative;
+        `;
+        wrap.title = `${card.name}\nClick to add a copy`;
+
+        const badge = wrap.createEl('div');
+        badge.textContent = `×${card.count}`;
+        badge.style.cssText = `
+            position: absolute; top: 4px; left: 4px; background: #374151; color: #e2e8f0;
+            font-size: 0.6em; padding: 1px 5px; border-radius: 8px; font-family: monospace; font-weight: bold;
+        `;
+
+        // Remove button (top-right) — removes ONE copy of this card, same
+        // decrement-not-wipe behavior as the Deck Builder's ✕.
+        const removeBtn = wrap.createEl('div');
+        removeBtn.textContent = '✕';
+        removeBtn.title = `Remove 1 copy of "${card.name}"`;
+        removeBtn.style.cssText = `
+            position: absolute; top: 3px; right: 3px; width: 15px; height: 15px;
+            border-radius: 50%; background: #1f2937; color: #6b7280; font-size: 0.6em;
+            display: flex; align-items: center; justify-content: center; opacity: 0.35;
+            transition: opacity .12s, background .12s, color .12s; cursor: pointer;
+        `;
+        wrap.onmouseenter = () => { wrap.style.transform = 'scale(1.06)'; removeBtn.style.opacity = '0.85'; };
+        wrap.onmouseleave = () => { wrap.style.transform = 'scale(1)'; removeBtn.style.opacity = '0.35'; };
+        removeBtn.onmouseenter = () => { removeBtn.style.background = '#7f1d1d'; removeBtn.style.color = '#fca5a5'; };
+        removeBtn.onmouseleave = () => { removeBtn.style.background = '#1f2937'; removeBtn.style.color = '#6b7280'; };
+
+        const img = wrap.createEl('img');
+        img.src = card.image;
+        img.style.cssText = 'width: 82px; border-radius: 4px; display: block; pointer-events: none;';
+
+        const nameEl = wrap.createEl('div');
+        nameEl.textContent = card.name.length > 17 ? card.name.slice(0, 15) + '…' : card.name;
+        nameEl.style.cssText = `
+            font-size: 0.6em; text-align: center; color: #cbd5e1; margin-top: 5px;
+            line-height: 1.3; max-width: 100px; font-family: monospace;
+        `;
+
+        wrap.onclick = async () => {
+            card.count = (card.count || 0) + 1;
+            badge.textContent = `×${card.count}`;
+            await this.saveCard(card);
+            this.renderStats();
+        };
+        removeBtn.onclick = async (e) => {
+            e.stopPropagation();
+            await this.removeCard(card);
+        };
+    }
+
+    async saveCard(card) {
+        const content = await this.plugin.readCollection();
+        if (content === null) {
+            this.setStatus(`⚠️ No collection note at "${this.plugin.settings.collectionNotePath}" — create it via Settings first.`);
+            return;
+        }
+        const updated = upsertCollectionCard(content, card.name, card.rarity || 'N', card.count);
+        const success = await this.plugin.writeCollection(updated);
+        this.setStatus(success
+            ? `💾 "${card.name}" ×${card.count} saved to collection.`
+            : `❌ Failed to save "${card.name}".`);
+    }
+
+    async removeCard(card) {
+        const content = await this.plugin.readCollection();
+        if (content === null) return;
+        const { content: updated, removed, newCount } = decrementCollectionCard(content, card.name);
+        const success = await this.plugin.writeCollection(updated);
+        if (!success) { this.setStatus(`❌ Failed to update "${card.name}".`); return; }
+        if (removed) {
+            this.cards = this.cards.filter(c => c !== card);
+            this.setStatus(`🗑️ "${card.name}" removed from collection.`);
+        } else {
+            card.count = newCount;
+            this.setStatus(`➖ "${card.name}" now ×${newCount}.`);
+        }
+        this.switchTab(this.activeTab);
+        this.renderStats();
+    }
+
+    async loadCollection() {
+        const content = await this.plugin.readCollection();
+        if (content === null) {
+            this.setStatus(`⚠️ No collection note found at "${this.plugin.settings.collectionNotePath}". Create one via Settings → 📦 Create Collection Note.`);
+            this.cards = [];
+            this.switchTab(this.activeTab);
+            this.renderStats();
+            return;
+        }
+        const entries = parseCollectionFromMarkdown(content);
+        if (entries.size === 0) {
+            this.setStatus('No cards in your collection note yet — add some above.');
+            this.cards = [];
+            this.switchTab(this.activeTab);
+            this.renderStats();
+            return;
+        }
+        this.cards = [];
+        this.setStatus(`Fetching ${entries.size} unique cards…`);
+        let loaded = 0;
+        for (const entry of entries.values()) {
+            const card = await this.plugin.fetchCard(entry.name);
+            if (card) {
+                card.count = entry.count;
+                this.cards.push(card);
+            }
+            loaded++;
+            this.setStatus(`Loading ${loaded}/${entries.size}: ${entry.name}`);
+            await new Promise(r => setTimeout(r, 110));
+        }
+        this.setStatus(`✅ ${this.cards.length} cards loaded.`);
+        this.switchTab(this.activeTab);
+        this.renderStats();
+    }
+
+    onClose() { this.contentEl.empty(); }
+}
+
 class YugiohSettingTab extends PluginSettingTab {
     constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
 
@@ -2401,6 +2964,36 @@ class YugiohSettingTab extends PluginSettingTab {
                 .setButtonText('📄 Create Template')
                 .setCta()
                 .onClick(() => this.plugin.createDeckTemplate())
+            );
+
+        containerEl.createEl('h3', { text: '📦 Collection' });
+        containerEl.createEl('p', {
+            text: 'Tracks every card you own, independent of any single deck. Used by the Collection Manager and the Deck Builder\'s "have vs need" badges and 📦 Craft List.'
+        });
+        new Setting(containerEl)
+            .setName('Collection note path')
+            .setDesc('Vault path to the note that tracks owned cards (e.g. "Yu-Gi-Oh Collection.md").')
+            .addText(text => text
+                .setValue(this.plugin.settings.collectionNotePath)
+                .onChange(async (value) => {
+                    this.plugin.settings.collectionNotePath = value.trim() || DEFAULT_SETTINGS.collectionNotePath;
+                    await this.plugin.saveSettings();
+                })
+            );
+        new Setting(containerEl)
+            .setName('Create collection note')
+            .setDesc('Creates a blank collection note at the path above if it doesn\'t exist yet, and opens it.')
+            .addButton(btn => btn
+                .setButtonText('📦 Create Collection Note')
+                .setCta()
+                .onClick(() => this.plugin.createCollectionNote())
+            );
+        new Setting(containerEl)
+            .setName('Open collection note')
+            .setDesc('Opens the existing collection note directly, for manual editing (bulk-pasting a list, fixing a typo, etc.) instead of the Collection Manager UI.')
+            .addButton(btn => btn
+                .setButtonText('📂 Open Note')
+                .onClick(() => this.plugin.openCollectionNote())
             );
 
         containerEl.createEl('h3', { text: '🚫 Master Duel Banlist' });
