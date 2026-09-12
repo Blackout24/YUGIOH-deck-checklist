@@ -1239,13 +1239,21 @@ class YugiohPlugin extends Plugin {
         if (filters.level) params.set('level', String(filters.level));
         if (filters.archetype) params.set('archetype', filters.archetype.trim());
         params.set('misc', 'yes');
-        params.set('num', '40');
+
+        // Alt art cards are sparse and scattered across the ~30k-card database
+        // (not clustered alphabetically), so the normal 40-card page essentially
+        // never contains one unless a name/type/archetype filter has already
+        // narrowed things down hard. When "alt art only" is checked, widen the
+        // page size a lot so the filter actually has something to find instead
+        // of silently checking an arbitrary slice.
+        const numLimit = filters.altArtOnly ? 99999 : 40;
+        params.set('num', String(numLimit));
         params.set('offset', '0');
 
         const realFilterKeys = ['fname', 'type', 'attribute', 'level', 'archetype'];
-        const hasRealFilter = realFilterKeys.some(k => params.has(k)) || filters.rarity;
+        const hasRealFilter = realFilterKeys.some(k => params.has(k)) || filters.rarity || filters.altArtOnly;
         if (!hasRealFilter) {
-            return { error: 'Enter at least one filter (name, type, attribute, level, archetype, or rarity).' };
+            return { error: 'Enter at least one filter (name, type, attribute, level, archetype, rarity, or alt art only).' };
         }
 
         try {
@@ -1260,23 +1268,51 @@ class YugiohPlugin extends Plugin {
             }
             const data = await res.json();
             if (!data.data || data.data.length === 0) return { results: [] };
+            const baseCount = data.data.length;
 
-            let results = data.data.map(c => ({
-                name: c.name, type: c.type, atk: c.atk, def: c.def,
-                level: c.level ?? c.linkval, attribute: c.attribute, race: c.race,
-                desc: c.desc, image: c.card_images[0].image_url,
-                archetype: c.archetype,
-                ban_tcg: c.banlist_info?.ban_tcg || 'Unlimited',
-                konami_id: c.misc_info?.[0]?.konami_id,
-                ban_md: this.getBanStatusMD(c.misc_info?.[0]?.konami_id),
-                rarity: this.rarityDB[c.name] || this.normalizeMdRarity(c.misc_info?.[0]?.md_rarity) || this.getRarity(c),
-                frameType: c.frameType
-            }));
+            // card_images holds every art variant for this card (index 0 is
+            // the default/original art, any further entries are alt arts) —
+            // expand each into its own result tile instead of only ever
+            // taking [0], or alt arts never appear at all.
+            let results = [];
+            for (const c of data.data) {
+                const base = {
+                    name: c.name, type: c.type, atk: c.atk, def: c.def,
+                    level: c.level ?? c.linkval, attribute: c.attribute, race: c.race,
+                    desc: c.desc, archetype: c.archetype,
+                    ban_tcg: c.banlist_info?.ban_tcg || 'Unlimited',
+                    konami_id: c.misc_info?.[0]?.konami_id,
+                    ban_md: this.getBanStatusMD(c.misc_info?.[0]?.konami_id),
+                    rarity: this.rarityDB[c.name] || this.normalizeMdRarity(c.misc_info?.[0]?.md_rarity) || this.getRarity(c),
+                    frameType: c.frameType
+                };
+                const images = c.card_images && c.card_images.length ? c.card_images : [];
+                images.forEach((img, idx) => {
+                    results.push({
+                        ...base,
+                        image: img.image_url,
+                        artId: img.id,
+                        artVariant: idx > 0 ? (images.length > 2 ? `Alt Art ${idx}` : 'Alt Art') : null,
+                    });
+                });
+            }
 
             if (filters.rarity) {
                 results = results.filter(c => c.rarity === filters.rarity);
             }
-            return { results };
+            if (filters.altArtOnly) {
+                results = results.filter(c => c.artVariant);
+            }
+
+            const totalMatches = results.length;
+            const DISPLAY_CAP = 60;
+            if (results.length > DISPLAY_CAP) results = results.slice(0, DISPLAY_CAP);
+
+            return {
+                results,
+                totalMatches,
+                capped: filters.altArtOnly ? totalMatches > DISPLAY_CAP : baseCount >= numLimit,
+            };
         } catch (err) {
             console.error('[YugiohPlugin] searchCards error:', err);
             return { error: 'Network error while searching.' };
@@ -3410,6 +3446,15 @@ class CardSearchUI extends Modal {
             opt.value = val; opt.textContent = val ? `MD: ${val}` : 'Any rarity';
         });
 
+        const altArtLabel = form.createEl('label');
+        altArtLabel.style.cssText = `
+            display: flex; align-items: center; gap: 5px; font-size: 0.78em;
+            color: #cbd5e1; font-family: monospace; cursor: pointer; white-space: nowrap;
+        `;
+        const altArtCheckbox = altArtLabel.createEl('input');
+        altArtCheckbox.type = 'checkbox';
+        altArtLabel.appendText('🎨 Alt art only');
+
         const searchBtn = form.createEl('button');
         searchBtn.textContent = '🔎 Search';
         searchBtn.style.cssText = `
@@ -3442,12 +3487,15 @@ class CardSearchUI extends Modal {
             const filters = {
                 name: nameInput.value, type: typeSelect.value, attribute: attrSelect.value,
                 level: levelInput.value, archetype: archetypeInput.value, rarity: raritySelect.value,
+                altArtOnly: altArtCheckbox.checked,
             };
             this.loading = true; searchBtn.disabled = true;
-            statusBar.textContent = 'Searching…';
+            statusBar.textContent = filters.altArtOnly
+                ? 'Scanning the full card database for alt arts — this can take a few seconds…'
+                : 'Searching…';
             grid.empty();
 
-            const { results, error } = await this.plugin.searchCards(filters);
+            const { results, error, capped, totalMatches } = await this.plugin.searchCards(filters);
             this.loading = false; searchBtn.disabled = false;
 
             if (error) {
@@ -3458,7 +3506,10 @@ class CardSearchUI extends Modal {
                 statusBar.textContent = 'No cards matched those filters.';
                 return;
             }
-            statusBar.textContent = `${results.length} result${results.length > 1 ? 's' : ''}${results.length === 40 ? ' (capped at 40 — narrow your filters for more)' : ''} — click a card to add it.`;
+            const countLabel = capped && totalMatches != null
+                ? `${results.length} of ${totalMatches} results`
+                : `${results.length} result${results.length > 1 ? 's' : ''}`;
+            statusBar.textContent = `${countLabel}${filters.altArtOnly ? ' (alt art)' : ' (incl. alt arts)'}${capped ? ' — add a name/type/archetype filter to narrow' : ''} — click a card to add it.`;
             for (const card of results) this.renderResultTile(card, grid);
         };
     }
@@ -3473,7 +3524,7 @@ class CardSearchUI extends Modal {
             border: 1.5px solid ${rarityColor}77; cursor: pointer;
             transition: transform .15s, border-color .15s;
         `;
-        wrap.title = `${card.name}\n${card.type}\n${card.desc?.slice(0, 140) ?? ''}…\nClick to add`;
+        wrap.title = `${card.name}${card.artVariant ? ` (${card.artVariant})` : ''}\n${card.type}\n${card.desc?.slice(0, 140) ?? ''}…\nClick to add`;
 
         wrap.onmouseenter = () => { wrap.style.transform = 'scale(1.06)'; wrap.style.borderColor = rarityColor; };
         wrap.onmouseleave = () => { wrap.style.transform = 'scale(1)'; wrap.style.borderColor = rarityColor + '77'; };
@@ -3488,6 +3539,12 @@ class CardSearchUI extends Modal {
             font-size: 0.6em; text-align: center; color: #cbd5e1;
             margin-top: 5px; line-height: 1.3; max-width: 100px; font-family: monospace;
         `;
+
+        if (card.artVariant) {
+            const artEl = wrap.createEl('div');
+            artEl.textContent = `🎨 ${card.artVariant}`;
+            artEl.style.cssText = 'font-size: 0.56em; color: #c084f5; margin-top: 1px; font-family: monospace;';
+        }
 
         const rarityEl = wrap.createEl('div');
         rarityEl.textContent = RARITY_LABEL[card.rarity] || card.rarity;
