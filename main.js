@@ -1352,6 +1352,7 @@ const RARITY_LABEL = { UR: '◆ UR', SR: '◇ SR', R: '● R', N: '○ N' };
 const ROLE_META = {
     starter: { label: '🟢 Starter', color: '#4ade80' },
     extender: { label: '🔵 Extender', color: '#60a5fa' },
+    handtrap: { label: '🪤 Hand Trap', color: '#f87171' },
     brick: { label: '🟤 Brick', color: '#a8a29e' },
     other: { label: '⚪ Other', color: '#94a3b8' },
 };
@@ -1370,9 +1371,10 @@ function classifyCardRole(card) {
     }
 
     // Known hand traps and hand-trap-style staple disruption (see HAND_TRAPS
-    // comment) — disruption, not a combo starter/extender/brick.
+    // comment) — its own bucket, distinct from "Other", since it's a
+    // well-defined disruption role rather than a catch-all.
     if (HAND_TRAPS.includes(card.name)) {
-        return { role: 'other', reason: 'Disruption/negation staple — not a combo piece.' };
+        return { role: 'handtrap', reason: 'Disruption/negation staple — not a combo piece.' };
     }
 
     // ── Brick checks ────────────────────────────────────────────────────────
@@ -2835,7 +2837,7 @@ class DeckUI extends Modal {
             return;
         }
 
-        const buckets = { starter: [], extender: [], brick: [], other: [] };
+        const buckets = { starter: [], extender: [], handtrap: [], brick: [], other: [] };
         let totalCopies = 0;
         for (const card of cards) {
             const { role, reason } = classifyCardRole(card);
@@ -2844,10 +2846,13 @@ class DeckUI extends Modal {
             buckets[role].push({ card, copies, reason });
         }
 
+        // ── Deck composition (M/S/T ratio, level curve, attributes, avg ATK) ──
+        this.renderDeckStats(container, cards);
+
         // ── Percentage bars ──────────────────────────────────────────────────
         const barsWrap = container.createEl('div');
         barsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;';
-        for (const role of ['starter', 'extender', 'brick', 'other']) {
+        for (const role of ['starter', 'extender', 'handtrap', 'brick', 'other']) {
             const items = buckets[role];
             const copies = items.reduce((n, i) => n + i.copies, 0);
             const pct = totalCopies > 0 ? Math.round((copies / totalCopies) * 100) : 0;
@@ -2866,7 +2871,7 @@ class DeckUI extends Modal {
         }
 
         // ── Per-card breakdown ───────────────────────────────────────────────
-        for (const role of ['starter', 'extender', 'brick', 'other']) {
+        for (const role of ['starter', 'extender', 'handtrap', 'brick', 'other']) {
             const items = buckets[role];
             if (items.length === 0) continue;
             const meta = ROLE_META[role];
@@ -2891,6 +2896,119 @@ class DeckUI extends Modal {
                 const reasonSpan = line.createEl('span');
                 reasonSpan.style.cssText = 'color: #6b7280; text-align: right; max-width: 55%;';
                 reasonSpan.textContent = reason;
+            }
+        }
+    }
+
+    // Composition stats in the spirit of dedicated deckbuilding sites (M/S/T
+    // ratio, level curve, attribute spread, average ATK) — separate from the
+    // Starter/Extender/Brick heuristic above, which is about combo function
+    // rather than raw composition. Copies-weighted, like the role bars.
+    renderDeckStats(container, cards) {
+        const mst = { Monster: 0, Spell: 0, Trap: 0 };
+        const levelCurve = {}; // level -> copies, monsters only
+        const attributes = {}; // attribute -> copies, monsters only
+        let atkTotal = 0, atkCount = 0;
+
+        for (const card of cards) {
+            const copies = card.count || 1;
+            const type = card.type || '';
+            const bucket = type.includes('Monster') ? 'Monster' : type.includes('Spell') ? 'Spell' : type.includes('Trap') ? 'Trap' : null;
+            if (bucket) mst[bucket] += copies;
+
+            if (bucket === 'Monster') {
+                if (card.level != null && card.level !== '') {
+                    levelCurve[card.level] = (levelCurve[card.level] || 0) + copies;
+                }
+                if (card.attribute) {
+                    attributes[card.attribute] = (attributes[card.attribute] || 0) + copies;
+                }
+                if (typeof card.atk === 'number' && card.atk >= 0) {
+                    atkTotal += card.atk * copies;
+                    atkCount += copies;
+                }
+            }
+        }
+
+        const wrap = container.createEl('div');
+        wrap.style.cssText = 'margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid #1f2937;';
+
+        const heading = wrap.createEl('div');
+        heading.textContent = '📊 Deck Composition';
+        heading.style.cssText = 'font-family: monospace; font-size: 0.85em; font-weight: bold; color: #f472b6; margin-bottom: 10px;';
+
+        // M/S/T ratio
+        const mstTotal = mst.Monster + mst.Spell + mst.Trap;
+        const mstRow = wrap.createEl('div');
+        mstRow.style.cssText = 'display: flex; justify-content: space-between; font-family: monospace; font-size: 0.78em; color: #94a3b8; margin-bottom: 5px;';
+        mstRow.createEl('span', { text: 'M / S / T' });
+        mstRow.createEl('span', { text: `${mst.Monster} / ${mst.Spell} / ${mst.Trap}` });
+
+        const mstBar = wrap.createEl('div');
+        mstBar.style.cssText = 'display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 16px; background: #1f2937;';
+        const mstColors = { Monster: '#4ade80', Spell: '#60a5fa', Trap: '#f472b6' };
+        for (const key of ['Monster', 'Spell', 'Trap']) {
+            if (mst[key] === 0) continue;
+            const seg = mstBar.createEl('div');
+            const pct = mstTotal > 0 ? (mst[key] / mstTotal) * 100 : 0;
+            seg.style.cssText = `width: ${pct}%; background: ${mstColors[key]};`;
+        }
+
+        // Average ATK
+        if (atkCount > 0) {
+            const avgAtk = Math.round(atkTotal / atkCount);
+            const atkLine = wrap.createEl('div');
+            atkLine.style.cssText = 'font-family: monospace; font-size: 0.78em; color: #94a3b8; margin-bottom: 16px;';
+            atkLine.textContent = `Average ATK (monsters): ${avgAtk.toLocaleString()}`;
+        }
+
+        // Level/Rank curve
+        const levels = Object.keys(levelCurve).map(Number).sort((a, b) => a - b);
+        if (levels.length > 0) {
+            const levelHeading = wrap.createEl('div');
+            levelHeading.textContent = 'Level / Rank curve';
+            levelHeading.style.cssText = 'font-family: monospace; font-size: 0.76em; color: #6b7280; margin-bottom: 6px;';
+
+            const maxLevelCopies = Math.max(...levels.map(l => levelCurve[l]));
+            const curveRow = wrap.createEl('div');
+            curveRow.style.cssText = 'display: flex; align-items: flex-end; gap: 4px; height: 60px; margin-bottom: 16px;';
+            for (let lvl = Math.min(...levels); lvl <= Math.max(...levels); lvl++) {
+                const copies = levelCurve[lvl] || 0;
+                const col = curveRow.createEl('div');
+                col.style.cssText = 'display: flex; flex-direction: column; align-items: center; justify-content: flex-end; flex: 1; height: 100%;';
+                const bar = col.createEl('div');
+                const h = maxLevelCopies > 0 ? Math.max((copies / maxLevelCopies) * 40, copies > 0 ? 3 : 0) : 0;
+                bar.style.cssText = `width: 100%; height: ${h}px; background: ${copies > 0 ? '#60a5fa' : 'transparent'}; border-radius: 2px 2px 0 0;`;
+                bar.title = `Level/Rank ${lvl}: ${copies}`;
+                const lbl = col.createEl('div');
+                lbl.textContent = String(lvl);
+                lbl.style.cssText = 'font-size: 0.6em; color: #6b7280; font-family: monospace; margin-top: 3px;';
+            }
+        }
+
+        // Attribute spread
+        const attrKeys = Object.keys(attributes);
+        if (attrKeys.length > 0) {
+            const attrHeading = wrap.createEl('div');
+            attrHeading.textContent = 'Attributes';
+            attrHeading.style.cssText = 'font-family: monospace; font-size: 0.76em; color: #6b7280; margin-bottom: 6px;';
+
+            const attrColors = {
+                DARK: '#a78bfa', LIGHT: '#fde68a', EARTH: '#a8a29e',
+                WATER: '#60a5fa', FIRE: '#f87171', WIND: '#4ade80', DIVINE: '#f472b6',
+            };
+            const attrWrap = wrap.createEl('div');
+            attrWrap.style.cssText = 'display: flex; flex-wrap: wrap; gap: 6px;';
+            const monsterCopies = mst.Monster || 1;
+            for (const attr of attrKeys.sort((a, b) => attributes[b] - attributes[a])) {
+                const chip = attrWrap.createEl('div');
+                const pct = Math.round((attributes[attr] / monsterCopies) * 100);
+                chip.style.cssText = `
+                    font-family: monospace; font-size: 0.72em; padding: 3px 8px; border-radius: 10px;
+                    background: ${attrColors[attr] || '#94a3b8'}22; color: ${attrColors[attr] || '#94a3b8'};
+                    border: 1px solid ${attrColors[attr] || '#94a3b8'}55;
+                `;
+                chip.textContent = `${attr}: ${attributes[attr]} (${pct}%)`;
             }
         }
     }
