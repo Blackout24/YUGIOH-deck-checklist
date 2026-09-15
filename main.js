@@ -1958,6 +1958,35 @@ class DeckUI extends Modal {
         return true;
     }
 
+    // Shared delete/update for combo lines — both act on combo.rawText (the
+    // exact original markdown line captured by the parser) so they can find
+    // and replace/remove precisely the right line without disturbing anything
+    // else in the note, then reparse this.combos from the saved result.
+    async deleteComboText(rawText) {
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+        const idx = fileContent.indexOf(rawText);
+        if (idx === -1) { new Notice('Could not find that combo line in the note — it may have changed.'); return false; }
+        let end = idx + rawText.length;
+        if (fileContent[end] === '\r' && fileContent[end + 1] === '\n') end += 2;
+        else if (fileContent[end] === '\n') end += 1;
+        const updated = fileContent.slice(0, idx) + fileContent.slice(end);
+        await this.plugin.writeTemplate(updated);
+        this.combos = parseCombosFromMarkdown(updated);
+        return true;
+    }
+
+    async updateComboText(oldRawText, newText, learned) {
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+        if (!fileContent.includes(oldRawText)) { new Notice('Could not find that combo line in the note — it may have changed.'); return false; }
+        const newLine = `- [${learned ? 'x' : ' '}] ${newText}`;
+        const updated = fileContent.replace(oldRawText, newLine);
+        await this.plugin.writeTemplate(updated);
+        this.combos = parseCombosFromMarkdown(updated);
+        return true;
+    }
+
     renderCombos(container) {
         const allCombos = this.combos || [];
 
@@ -2398,6 +2427,56 @@ class DeckUI extends Modal {
 
                     row.appendChild(check);
                     row.appendChild(contentCol);
+
+                    // Edit / Delete — stopPropagation so they don't also
+                    // trigger the row's learned-toggle click handler below.
+                    const actionsCol = row.createEl('div');
+                    actionsCol.style.cssText = 'display: flex; gap: 2px; flex-shrink: 0; padding-top: 1px;';
+
+                    const mkActionBtn = (icon) => {
+                        const b = actionsCol.createEl('button');
+                        b.textContent = icon;
+                        b.style.cssText = `
+                            background: none; border: none; cursor: pointer; font-size: 0.85em;
+                            padding: 3px 6px; border-radius: 4px; opacity: 0.55; transition: opacity .12s, background .12s;
+                        `;
+                        b.onmouseenter = () => { b.style.opacity = '1'; b.style.background = '#1f2937'; };
+                        b.onmouseleave = () => { if (!b.dataset.confirming) { b.style.opacity = '0.55'; b.style.background = 'none'; } };
+                        return b;
+                    };
+
+                    const editBtn = mkActionBtn('✏️');
+                    editBtn.title = 'Edit combo';
+                    editBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        new ComboBuilderUI(this.app, this.plugin, this, categories, combo).open();
+                    };
+
+                    const deleteBtn = mkActionBtn('🗑️');
+                    deleteBtn.title = 'Delete combo';
+                    deleteBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        if (!deleteBtn.dataset.confirming) {
+                            deleteBtn.dataset.confirming = '1';
+                            deleteBtn.textContent = '❗ confirm';
+                            deleteBtn.style.opacity = '1';
+                            deleteBtn.style.color = '#f87171';
+                            setTimeout(() => {
+                                if (deleteBtn.dataset.confirming) {
+                                    delete deleteBtn.dataset.confirming;
+                                    deleteBtn.textContent = '🗑️';
+                                    deleteBtn.style.opacity = '0.55';
+                                    deleteBtn.style.color = '';
+                                }
+                            }, 2500);
+                            return;
+                        }
+                        const ok = await this.deleteComboText(combo.rawText);
+                        if (!ok) return;
+                        this.switchTab('combos');
+                        this.setStatus(`🗑️ Combo deleted: "${combo.text.slice(0, 40)}"`);
+                    };
+                    row.appendChild(actionsCol);
 
                     // Click to toggle learned
                     row.onclick = async () => {
@@ -3717,11 +3796,12 @@ class CardSearchUI extends Modal {
 // same "- [ ] A → B → C" markdown line the text parser already understands —
 // this is a friendlier input method, not a new storage format.
 class ComboBuilderUI extends Modal {
-    constructor(app, plugin, deckUI, categories) {
+    constructor(app, plugin, deckUI, categories, existingCombo = null) {
         super(app);
         this.plugin = plugin;
         this.deckUI = deckUI;
         this.categories = categories || [];
+        this.existingCombo = existingCombo;
         this.stepRows = []; // { rowEl, input, dropdown }
     }
 
@@ -3752,22 +3832,24 @@ class ComboBuilderUI extends Modal {
             padding: 16px 24px 12px; border-bottom: 2px solid #a78bfa44;
         `;
         const title = header.createEl('h1');
-        title.textContent = '🧩 Visual Combo Builder';
+        title.textContent = this.existingCombo ? '✏️ Edit Combo' : '🧩 Visual Combo Builder';
         title.style.cssText = `
             margin: 0 0 3px; font-size: 1.25em; font-weight: bold;
             background: linear-gradient(90deg, #a78bfa, #c4b5fd);
             -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
         `;
         const sub = header.createEl('p');
-        sub.textContent = 'Pick each step from your known cards — art resolves automatically. Unrecognized text still works as a shorthand step.';
+        sub.textContent = this.existingCombo
+            ? 'Editing steps only — category stays where this combo already lives in the note.'
+            : 'Pick each step from your known cards — art resolves automatically. Unrecognized text still works as a shorthand step.';
         sub.style.cssText = 'margin: 0; font-size: 0.7em; color: #94a3b8; font-family: monospace;';
 
         const body = contentEl.createEl('div');
         body.style.cssText = 'padding: 16px 24px 20px; max-height: 68vh; overflow-y: auto;';
 
-        // ── Category ─────────────────────────────────────────────────────────
+        // ── Category (hidden when editing — see sub text above) ────────────────
         const catRow = body.createEl('div');
-        catRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 14px;';
+        catRow.style.cssText = `display: ${this.existingCombo ? 'none' : 'flex'}; gap: 8px; margin-bottom: 14px;`;
         const catFieldStyle = `
             background: #1f2937; border: 1px solid #4c1d95; border-radius: 6px;
             padding: 7px 10px; color: #e2e8f0; font-size: 0.82em; outline: none; font-family: monospace;
@@ -3820,7 +3902,7 @@ class ComboBuilderUI extends Modal {
         `;
         cancelBtn.onclick = () => this.close();
 
-        const saveBtn = actions.createEl('button', { text: '💾 Save Combo' });
+        const saveBtn = actions.createEl('button', { text: this.existingCombo ? '💾 Save Changes' : '💾 Save Combo' });
         saveBtn.style.cssText = `
             background: #7c3aed; color: #fff; border: none;
             padding: 7px 15px; border-radius: 6px; cursor: pointer;
@@ -3832,17 +3914,36 @@ class ComboBuilderUI extends Modal {
                 return new Notice('Add at least 2 steps to form a combo.');
             }
             const text = steps.join(' → ');
-            const cat = catCustom.value.trim() || catSelect.value;
-            const ok = await this.deckUI.saveComboText(text, cat, this.categories);
+            let ok;
+            if (this.existingCombo) {
+                ok = await this.deckUI.updateComboText(this.existingCombo.rawText, text, this.existingCombo.learned);
+            } else {
+                const cat = catCustom.value.trim() || catSelect.value;
+                ok = await this.deckUI.saveComboText(text, cat, this.categories);
+            }
             if (!ok) return;
             this.deckUI.switchTab('combos');
-            this.deckUI.setStatus(`✅ Combo added: "${text.slice(0, 50)}"`);
+            this.deckUI.setStatus(`✅ Combo ${this.existingCombo ? 'updated' : 'added'}: "${text.slice(0, 50)}"`);
             this.close();
         };
 
-        // Start with two empty steps — most combos need at least that many.
-        this.addStepRow(stepsWrap);
-        this.addStepRow(stepsWrap);
+        // Prefill from the existing combo when editing; otherwise start with
+        // two empty steps — most combos need at least that many.
+        if (this.existingCombo) {
+            const existingSteps = this.existingCombo.text.split(/→|->|➜/).map(s => s.trim()).filter(Boolean);
+            if (existingSteps.length > 0) {
+                existingSteps.forEach(s => {
+                    this.addStepRow(stepsWrap);
+                    this.stepRows[this.stepRows.length - 1].input.value = s;
+                });
+            } else {
+                this.addStepRow(stepsWrap);
+                this.addStepRow(stepsWrap);
+            }
+        } else {
+            this.addStepRow(stepsWrap);
+            this.addStepRow(stepsWrap);
+        }
         this.updatePreview();
     }
 
