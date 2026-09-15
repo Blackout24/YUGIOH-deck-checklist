@@ -1673,14 +1673,33 @@ class DeckUI extends Modal {
             // Split on arrows to get individual step phrases
             const parts = combo.text.split(/→|->|➜/).map(s => s.trim()).filter(Boolean);
             // Generic action/connector words that are never a card name on their own —
-            // skip fuzzy-searching these to cut down noisy, useless API calls.
+            // skip fuzzy-searching these to cut down noisy, useless API calls, and strip
+            // them off the edges of a whole step phrase before fuzzy-searching that
+            // phrase verbatim (see stripStopwordEdges below).
             const STOPWORDS = new Set([
                 'mill', 'draw', 'dump', 'loop', 'setup', 'route', 'line', 'board',
                 'break', 'up', 'negate', 'summon', 'timing', 'pop', 'extender',
                 'the', 'and', 'of', 'in', 'to', 'for', 'on', 'at', 'as', 'or',
+                'set', 'activate', 'discard', 'banish', 'tribute', 'flip', 'target',
+                'return', 'add', 'send', 'shuffle', 'reveal', 'destroy', 'special', 'normal',
             ]);
+            // A step like "Set Tidying" fuzzy-searched verbatim can match some
+            // unrelated card whose name happens to score closer to the whole
+            // phrase than the real target does (e.g. "Set Tidying" → "Aquarium
+            // Set" instead of "Dragonmaid Tidying") — and because that wrong
+            // match gets cached under the exact key "set tidying", it then
+            // shadows the correct per-word fallback at render time. Strip
+            // leading/trailing action verbs before a phrase is used as a
+            // whole-phrase fuzzy-search candidate; the per-word windows below
+            // still cover the untouched original text.
+            const stripStopwordEdges = (phrase) => {
+                let w = phrase.split(/\s+/);
+                while (w.length > 1 && STOPWORDS.has(w[0].toLowerCase())) w = w.slice(1);
+                while (w.length > 1 && STOPWORDS.has(w[w.length - 1].toLowerCase())) w = w.slice(0, -1);
+                return w.join(' ');
+            };
             for (const part of parts) {
-                stepSet.add(part);
+                stepSet.add(stripStopwordEdges(part));
                 // A card name can sit anywhere in a phrase, with notes before or after
                 // it ("mill Tidying + Changeover setup", "Accesscode OTK route") — add
                 // every contiguous word-window so the card name surfaces on its own,
@@ -1704,7 +1723,8 @@ class DeckUI extends Modal {
                 const subParts = part.split(/[/+]/).map(s => s.trim()).filter(Boolean);
                 if (subParts.length > 1) {
                     for (const sub of subParts) {
-                        if (sub.length >= 3) stepSet.add(sub);
+                        const coreSub = stripStopwordEdges(sub);
+                        if (coreSub.length >= 3) stepSet.add(coreSub);
                         addWindows(sub);
                     }
                 }
