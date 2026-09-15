@@ -1930,6 +1930,34 @@ class DeckUI extends Modal {
         }
     }
 
+    // Shared by the quick-add text form and ComboBuilderUI — appends a combo
+    // line under a matching category heading (or the first COMBO section, or
+    // a brand-new section if neither exists), reparses this.combos, and
+    // returns whether it succeeded so callers can decide what to do next.
+    async saveComboText(text, cat, categories) {
+        const category = (cat && cat.trim()) || categories?.[0] || 'General';
+        const newLine = `- [ ] ${text}`;
+
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+
+        let updated = fileContent;
+        const catHeadingRe = new RegExp(`(^#{1,6}[^\\n]*${category.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*)`, 'im');
+        const comboHeadingRe = /^(#{1,6}[^\n]*\bcombo\b[^\n]*)/im;
+
+        if (catHeadingRe.test(updated)) {
+            updated = updated.replace(catHeadingRe, (m) => `${m}\n${newLine}`);
+        } else if (comboHeadingRe.test(updated)) {
+            updated = updated.replace(comboHeadingRe, (m) => `${m}\n${newLine}`);
+        } else {
+            updated += `\n\n## 🧠 COMBO CHECKLIST — ${category}\n${newLine}\n`;
+        }
+
+        await this.plugin.writeTemplate(updated);
+        this.combos = parseCombosFromMarkdown(updated);
+        return true;
+    }
+
     renderCombos(container) {
         const allCombos = this.combos || [];
 
@@ -2056,38 +2084,32 @@ class DeckUI extends Modal {
         saveComboBtn.onclick = async () => {
             const text = newComboInput.value.trim();
             if (!text) return new Notice('Enter a combo description.');
-            const cat = (catInput.value.trim() || categories[0] || 'General');
-            const newLine = `- [ ] ${text}`;
+            const cat = catInput.value.trim();
+            const ok = await this.saveComboText(text, cat, categories);
+            if (!ok) return;
 
-            const fileContent = await this.plugin.readTemplate();
-            if (!fileContent) return new Notice('No active file to save to.');
-
-            // Try to append under a matching heading, or the COMBO section, or end of file
-            let updated = fileContent;
-            const catHeadingRe = new RegExp(`(^#{1,6}[^\\n]*${cat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*)`, 'im');
-            const comboHeadingRe = /^(#{1,6}[^\n]*\bcombo\b[^\n]*)/im;
-
-            if (catHeadingRe.test(updated)) {
-                // Insert after the matching category heading's last item
-                updated = updated.replace(catHeadingRe, (m) => `${m}\n${newLine}`);
-            } else if (comboHeadingRe.test(updated)) {
-                // Insert at end of the first COMBO section
-                updated = updated.replace(comboHeadingRe, (m) => `${m}\n${newLine}`);
-            } else {
-                // Append a new combo section at end
-                updated += `\n\n## 🧠 COMBO CHECKLIST — ${cat}\n${newLine}\n`;
-            }
-
-            await this.plugin.writeTemplate(updated);
-            this.combos = parseCombosFromMarkdown(updated);
             newComboInput.value = '';
             addForm.style.display = 'none';
-            container.empty();
-            this.renderCombos(container);
             this.switchTab('combos');
             this.setStatus(`✅ Combo added: "${text.slice(0, 50)}"`);
         };
         newComboInput.addEventListener('keydown', e => { if (e.key === 'Enter') saveComboBtn.click(); });
+
+        // Visual Combo Builder — step-by-step picker with autocomplete against
+        // known cards (this.allCards + comboCardCache) and a live preview,
+        // instead of hand-typing the arrow-joined text. Saves through the same
+        // saveComboText() path as the quick-add form above.
+        const builderBtn = controls.createEl('button');
+        builderBtn.textContent = '🧩 Visual Builder';
+        builderBtn.style.cssText = `
+            background: #1e1b4b; color: #a78bfa; border: 1px solid #4c1d95;
+            padding: 5px 13px; border-radius: 6px; cursor: pointer;
+            font-size: 0.78em; font-family: monospace; font-weight: bold;
+            transition: opacity .12s;
+        `;
+        builderBtn.onmouseenter = () => builderBtn.style.opacity = '0.75';
+        builderBtn.onmouseleave = () => builderBtn.style.opacity = '1';
+        builderBtn.onclick = () => new ComboBuilderUI(this.app, this.plugin, this, categories).open();
 
         // ── List area ────────────────────────────────────────────────────────
         const listArea = container.createEl('div');
@@ -3685,6 +3707,262 @@ class CardSearchUI extends Modal {
                 setTimeout(() => { wrap.style.borderColor = rarityColor + '77'; }, 400);
             }
         };
+    }
+}
+
+// Visual Combo Builder — lets you assemble a combo as a sequence of card
+// steps (autocompleted against cards already known to the plugin: deck cards
+// + previously-resolved combo cards) instead of hand-typing the arrow-joined
+// text. Still saves through DeckUI.saveComboText(), so it produces the exact
+// same "- [ ] A → B → C" markdown line the text parser already understands —
+// this is a friendlier input method, not a new storage format.
+class ComboBuilderUI extends Modal {
+    constructor(app, plugin, deckUI, categories) {
+        super(app);
+        this.plugin = plugin;
+        this.deckUI = deckUI;
+        this.categories = categories || [];
+        this.stepRows = []; // { rowEl, input, dropdown }
+    }
+
+    getCandidatePool() {
+        const map = new Map();
+        for (const c of this.deckUI.allCards || []) {
+            if (!map.has(c.name.toLowerCase())) map.set(c.name.toLowerCase(), c);
+        }
+        for (const c of (this.deckUI.comboCardCache || new Map()).values()) {
+            if (!map.has(c.name.toLowerCase())) map.set(c.name.toLowerCase(), c);
+        }
+        return [...map.values()];
+    }
+
+    onOpen() {
+        this.pool = this.getCandidatePool();
+        this.modalEl.style.width = '640px';
+        this.modalEl.style.maxWidth = '95vw';
+
+        const { contentEl } = this;
+        contentEl.style.cssText = `
+            background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif; padding: 0;
+        `;
+
+        const header = contentEl.createEl('div');
+        header.style.cssText = `
+            background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%);
+            padding: 16px 24px 12px; border-bottom: 2px solid #a78bfa44;
+        `;
+        const title = header.createEl('h1');
+        title.textContent = '🧩 Visual Combo Builder';
+        title.style.cssText = `
+            margin: 0 0 3px; font-size: 1.25em; font-weight: bold;
+            background: linear-gradient(90deg, #a78bfa, #c4b5fd);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        `;
+        const sub = header.createEl('p');
+        sub.textContent = 'Pick each step from your known cards — art resolves automatically. Unrecognized text still works as a shorthand step.';
+        sub.style.cssText = 'margin: 0; font-size: 0.7em; color: #94a3b8; font-family: monospace;';
+
+        const body = contentEl.createEl('div');
+        body.style.cssText = 'padding: 16px 24px 20px; max-height: 68vh; overflow-y: auto;';
+
+        // ── Category ─────────────────────────────────────────────────────────
+        const catRow = body.createEl('div');
+        catRow.style.cssText = 'display: flex; gap: 8px; margin-bottom: 14px;';
+        const catFieldStyle = `
+            background: #1f2937; border: 1px solid #4c1d95; border-radius: 6px;
+            padding: 7px 10px; color: #e2e8f0; font-size: 0.82em; outline: none; font-family: monospace;
+        `;
+        const catSelect = catRow.createEl('select');
+        catSelect.style.cssText = catFieldStyle + 'flex: 1;';
+        (this.categories.length ? this.categories : ['General']).forEach(cat => {
+            const opt = catSelect.createEl('option');
+            opt.value = cat; opt.textContent = cat;
+        });
+        const catCustom = catRow.createEl('input');
+        catCustom.placeholder = 'Or new category…';
+        catCustom.style.cssText = catFieldStyle + 'flex: 1;';
+
+        // ── Steps ────────────────────────────────────────────────────────────
+        const stepsHeading = body.createEl('div');
+        stepsHeading.textContent = 'Steps';
+        stepsHeading.style.cssText = 'font-family: monospace; font-size: 0.76em; color: #6b7280; margin-bottom: 6px;';
+
+        const stepsWrap = body.createEl('div');
+        stepsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px;';
+
+        const addStepBtn = body.createEl('button');
+        addStepBtn.textContent = '+ Add Step';
+        addStepBtn.style.cssText = `
+            background: #1f2937; color: #a78bfa; border: 1px dashed #4c1d95;
+            padding: 6px 12px; border-radius: 6px; cursor: pointer;
+            font-size: 0.78em; font-family: monospace; font-weight: bold; margin-bottom: 16px;
+        `;
+        addStepBtn.onclick = () => { this.addStepRow(stepsWrap); this.updatePreview(); };
+
+        // ── Live preview ─────────────────────────────────────────────────────
+        const previewHeading = body.createEl('div');
+        previewHeading.textContent = 'Preview';
+        previewHeading.style.cssText = 'font-family: monospace; font-size: 0.76em; color: #6b7280; margin-bottom: 6px;';
+        this.previewEl = body.createEl('div');
+        this.previewEl.style.cssText = `
+            display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-height: 44px;
+            background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 8px 10px;
+            margin-bottom: 18px;
+        `;
+
+        // ── Actions ──────────────────────────────────────────────────────────
+        const actions = body.createEl('div');
+        actions.style.cssText = 'display: flex; gap: 8px; justify-content: flex-end;';
+        const cancelBtn = actions.createEl('button', { text: 'Cancel' });
+        cancelBtn.style.cssText = `
+            background: #374151; color: #e2e8f0; border: none;
+            padding: 7px 15px; border-radius: 6px; cursor: pointer; font-size: 0.82em; font-family: monospace;
+        `;
+        cancelBtn.onclick = () => this.close();
+
+        const saveBtn = actions.createEl('button', { text: '💾 Save Combo' });
+        saveBtn.style.cssText = `
+            background: #7c3aed; color: #fff; border: none;
+            padding: 7px 15px; border-radius: 6px; cursor: pointer;
+            font-size: 0.82em; font-family: monospace; font-weight: bold;
+        `;
+        saveBtn.onclick = async () => {
+            const steps = this.stepRows.map(r => r.input.value.trim()).filter(Boolean);
+            if (steps.length < 2) {
+                return new Notice('Add at least 2 steps to form a combo.');
+            }
+            const text = steps.join(' → ');
+            const cat = catCustom.value.trim() || catSelect.value;
+            const ok = await this.deckUI.saveComboText(text, cat, this.categories);
+            if (!ok) return;
+            this.deckUI.switchTab('combos');
+            this.deckUI.setStatus(`✅ Combo added: "${text.slice(0, 50)}"`);
+            this.close();
+        };
+
+        // Start with two empty steps — most combos need at least that many.
+        this.addStepRow(stepsWrap);
+        this.addStepRow(stepsWrap);
+        this.updatePreview();
+    }
+
+    addStepRow(stepsWrap) {
+        const idx = this.stepRows.length;
+        const row = stepsWrap.createEl('div');
+        row.style.cssText = 'display: flex; gap: 6px; align-items: center; position: relative;';
+
+        const numLabel = row.createEl('span');
+        numLabel.textContent = `${idx + 1}.`;
+        numLabel.style.cssText = 'font-family: monospace; font-size: 0.8em; color: #6b7280; width: 18px; flex-shrink: 0;';
+
+        const input = row.createEl('input');
+        input.placeholder = 'Card name or shorthand step…';
+        input.style.cssText = `
+            flex: 1; background: #1f2937; border: 1px solid #374151; border-radius: 6px;
+            padding: 7px 10px; color: #e2e8f0; font-size: 0.84em; font-family: monospace; outline: none;
+        `;
+        input.addEventListener('focus', () => input.style.borderColor = '#a78bfa');
+        input.addEventListener('blur', () => setTimeout(() => { dropdown.style.display = 'none'; input.style.borderColor = '#374151'; }, 150));
+
+        const removeBtn = row.createEl('button');
+        removeBtn.textContent = '✕';
+        removeBtn.style.cssText = `
+            background: none; border: none; color: #6b7280; cursor: pointer;
+            font-size: 0.9em; padding: 4px 6px; flex-shrink: 0;
+        `;
+        removeBtn.onclick = () => {
+            row.remove();
+            this.stepRows = this.stepRows.filter(r => r.row !== row);
+            this.renumberSteps(stepsWrap);
+            this.updatePreview();
+        };
+
+        const dropdown = row.createEl('div');
+        dropdown.style.cssText = `
+            display: none; position: absolute; top: 100%; left: 24px; right: 0; z-index: 10;
+            background: #1f2937; border: 1px solid #4c1d95; border-radius: 6px;
+            max-height: 160px; overflow-y: auto; margin-top: 2px;
+        `;
+
+        input.addEventListener('input', () => {
+            const q = input.value.trim().toLowerCase();
+            dropdown.empty();
+            if (!q) { dropdown.style.display = 'none'; this.updatePreview(); return; }
+            const matches = this.pool.filter(c => c.name.toLowerCase().includes(q)).slice(0, 8);
+            if (matches.length === 0) { dropdown.style.display = 'none'; this.updatePreview(); return; }
+            for (const card of matches) {
+                const item = dropdown.createEl('div');
+                item.style.cssText = `
+                    display: flex; align-items: center; gap: 6px; padding: 5px 8px; cursor: pointer;
+                    font-family: monospace; font-size: 0.78em; color: #e2e8f0;
+                `;
+                item.onmouseenter = () => item.style.background = '#374151';
+                item.onmouseleave = () => item.style.background = 'none';
+                if (card.image) {
+                    const img = item.createEl('img');
+                    img.src = card.image;
+                    img.style.cssText = 'width: 18px; height: 26px; object-fit: cover; border-radius: 2px; flex-shrink: 0;';
+                }
+                item.appendChild(document.createTextNode(card.name));
+                item.onmousedown = (e) => {
+                    e.preventDefault();
+                    input.value = card.name;
+                    dropdown.style.display = 'none';
+                    this.updatePreview();
+                };
+            }
+            dropdown.style.display = 'block';
+            this.updatePreview();
+        });
+
+        this.stepRows.push({ row, input, dropdown });
+    }
+
+    renumberSteps(stepsWrap) {
+        [...stepsWrap.children].forEach((row, i) => {
+            const label = row.querySelector('span');
+            if (label) label.textContent = `${i + 1}.`;
+        });
+    }
+
+    updatePreview() {
+        this.previewEl.empty();
+        const steps = this.stepRows.map(r => r.input.value.trim()).filter(Boolean);
+        if (steps.length === 0) {
+            const hint = this.previewEl.createEl('span');
+            hint.textContent = 'Fill in steps above to see a preview…';
+            hint.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.78em;';
+            return;
+        }
+        steps.forEach((step, i) => {
+            const match = this.pool.find(c => c.name.toLowerCase() === step.toLowerCase());
+            if (match) {
+                const chip = this.previewEl.createEl('span');
+                chip.style.cssText = `
+                    display: inline-flex; align-items: center; gap: 4px;
+                    background: #1e1b4b; border: 1px solid #4c1d95; border-radius: 4px;
+                    padding: 2px 6px 2px 2px; font-size: 0.8em; color: #c4b5fd; font-family: monospace;
+                `;
+                if (match.image) {
+                    const img = chip.createEl('img');
+                    img.src = match.image;
+                    img.style.cssText = 'width: 20px; height: 29px; object-fit: cover; border-radius: 2px;';
+                }
+                chip.appendChild(document.createTextNode(match.name));
+            } else {
+                const chip = this.previewEl.createEl('span');
+                chip.textContent = step;
+                chip.style.cssText = `
+                    font-size: 0.8em; color: #94a3b8; font-family: monospace;
+                    background: #1f2937; border: 1px dashed #374151; border-radius: 4px; padding: 2px 6px;
+                `;
+            }
+            if (i < steps.length - 1) {
+                const arrow = this.previewEl.createEl('span');
+                arrow.textContent = '→';
+                arrow.style.cssText = 'color: #a78bfa; font-weight: bold; font-size: 0.9em;';
+            }
+        });
     }
 }
 
