@@ -1881,6 +1881,8 @@ class DeckUI extends Modal {
         const draw5Btn = this.makeBtn(controls, '🎲 Draw 5 · Going First', '#e8c84a', '#0d0f1a');
         const draw6Btn = this.makeBtn(controls, '🎲 Draw 6 · Going Second', '#c084f5', '#fff');
         const redrawBtn = this.makeBtn(controls, '🔄 Redraw', '#60a5fa', '#fff');
+        const consistency5Btn = this.makeBtn(controls, '📊 10k Hands (5)', '#4ade80', '#0d0f1a');
+        const consistency6Btn = this.makeBtn(controls, '📊 10k Hands (6)', '#4ade80', '#0d0f1a');
 
         const handWrap = container.createEl('div');
         handWrap.style.cssText = 'display: flex; gap: 10px; flex-wrap: wrap; padding: 6px 0;';
@@ -1916,7 +1918,106 @@ class DeckUI extends Modal {
         draw6Btn.onclick = () => doDraw(6);
         redrawBtn.onclick = () => doDraw(this.lastHandSize || 5);
 
+        // ── Consistency Test — thousands of simulated opening hands ──────────
+        const resultsWrap = container.createEl('div');
+        resultsWrap.style.cssText = 'margin-top: 18px; padding-top: 14px; border-top: 1px solid #1f2937; display: none;';
+
+        const runConsistency = (handSize) => {
+            if (pool.length === 0) { new Notice('No main deck cards to draw from — load a deck first.'); return; }
+            const btn = handSize === 5 ? consistency5Btn : consistency6Btn;
+            const originalLabel = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ Running…';
+            // Defer one tick so the "Running…" label actually paints before the
+            // (synchronous) simulation loop blocks the thread.
+            setTimeout(() => {
+                const stats = this.runConsistencyTest(pool, handSize, 10000);
+                this.renderConsistencyResults(resultsWrap, stats, handSize);
+                btn.disabled = false;
+                btn.textContent = originalLabel;
+            }, 10);
+        };
+        consistency5Btn.onclick = () => runConsistency(5);
+        consistency6Btn.onclick = () => runConsistency(6);
+
         renderHand();
+    }
+
+    // Simulates `trials` opening hands drawn from `pool` (already copies-
+    // weighted by buildDrawPool) without replacement per hand, classifying
+    // each card with the same classifyCardRole() heuristic the Analysis tab
+    // uses. A card's role never changes between copies, so it's cached by
+    // name to avoid redundantly re-running the regex checks per copy.
+    runConsistencyTest(pool, handSize, trials = 10000) {
+        const roleCache = new Map();
+        const getRole = (card) => {
+            if (!roleCache.has(card.name)) roleCache.set(card.name, classifyCardRole(card).role);
+            return roleCache.get(card.name);
+        };
+
+        let starterHands = 0, extenderHands = 0, handtrapHands = 0, brickHands = 0, playableHands = 0;
+        let starterTotal = 0;
+
+        for (let t = 0; t < trials; t++) {
+            const hand = this.shuffleSample(pool, handSize);
+            let starters = 0, hasExtender = false, hasHandtrap = false, hasNonBrick = false;
+            for (const card of hand) {
+                const role = getRole(card);
+                if (role === 'starter') { starters++; hasNonBrick = true; }
+                else if (role === 'extender') { hasExtender = true; hasNonBrick = true; }
+                else if (role === 'handtrap') { hasHandtrap = true; hasNonBrick = true; }
+                else if (role !== 'brick') { hasNonBrick = true; } // generic "other" staples still count as non-dead
+            }
+            if (starters > 0) starterHands++;
+            if (hasExtender) extenderHands++;
+            if (hasHandtrap) handtrapHands++;
+            if (!hasNonBrick) brickHands++; // every card in hand classified as brick
+            if (starters > 0 || hasHandtrap) playableHands++;
+            starterTotal += starters;
+        }
+
+        return {
+            trials, handSize,
+            starterPct: (starterHands / trials) * 100,
+            extenderPct: (extenderHands / trials) * 100,
+            handtrapPct: (handtrapHands / trials) * 100,
+            brickPct: (brickHands / trials) * 100,
+            playablePct: (playableHands / trials) * 100,
+            avgStarters: starterTotal / trials,
+        };
+    }
+
+    renderConsistencyResults(resultsWrap, stats, handSize) {
+        resultsWrap.style.display = 'block';
+        resultsWrap.empty();
+
+        const heading = resultsWrap.createEl('div');
+        heading.textContent = `📊 Consistency — ${stats.trials.toLocaleString()} hands of ${handSize}`;
+        heading.style.cssText = 'font-family: monospace; font-size: 0.85em; font-weight: bold; color: #4ade80; margin-bottom: 10px;';
+
+        const rows = [
+            ['🟢 Starter in hand', stats.starterPct, '#4ade80'],
+            ['🔵 Extender in hand', stats.extenderPct, '#60a5fa'],
+            ['🪤 Hand trap in hand', stats.handtrapPct, '#f87171'],
+            ['✅ Playable hand (starter or hand trap)', stats.playablePct, '#facc15'],
+            ['🟤 Brick (dead hand)', stats.brickPct, '#a8a29e'],
+        ];
+        for (const [label, pct, color] of rows) {
+            const row = resultsWrap.createEl('div');
+            row.style.cssText = 'margin-bottom: 8px;';
+            const labelRow = row.createEl('div');
+            labelRow.style.cssText = 'display: flex; justify-content: space-between; font-family: monospace; font-size: 0.8em; color: #cbd5e1; margin-bottom: 3px;';
+            labelRow.createEl('span', { text: label });
+            labelRow.createEl('span', { text: `${pct.toFixed(1)}%` });
+            const barBg = row.createEl('div');
+            barBg.style.cssText = 'height: 8px; background: #1f2937; border-radius: 4px; overflow: hidden;';
+            const barFill = barBg.createEl('div');
+            barFill.style.cssText = `height: 100%; width: ${pct}%; background: ${color}; border-radius: 4px; transition: width .4s;`;
+        }
+
+        const avgLine = resultsWrap.createEl('div');
+        avgLine.style.cssText = 'font-family: monospace; font-size: 0.78em; color: #94a3b8; margin-top: 6px;';
+        avgLine.textContent = `Average starters per hand: ${stats.avgStarters.toFixed(2)}`;
     }
 
     // Lightweight, non-interactive card tile for the hand simulator — unlike
