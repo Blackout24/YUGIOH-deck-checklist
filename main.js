@@ -74,6 +74,12 @@ function explicitGroup(heading) {
     // Extra deck top-level block
     if (/\bextra\s*deck\b/.test(h)) return 'extra';
 
+    // Side deck top-level block — must run before the generic main-deck check
+    // below (a heading like "Side Deck (15)" doesn't contain "main deck" so
+    // order doesn't strictly matter here, but keeping deck-zone checks
+    // together avoids future ambiguity).
+    if (/\bside\s*deck\b/.test(h)) return 'side';
+
     // Extra deck card types as standalone short headings (e.g. "## 🔥 Fusion")
     const stripped = h.replace(/\s+/g, ' ').trim();
     if (/^[#\s]*(fusion|link|xyz|synchro|pendulum|ritual)\s*(\(\d+\))?\s*$/.test(stripped)) return 'extra';
@@ -221,7 +227,7 @@ function parseEntryText(raw) {
 const SKIP_WORDS = ['additional', 'budget', 'tech', 'none', 'optional', 'cards'];
 
 // Parse cards from markdown - section-aware, dual-format.
-// Returns entries tagged with deckGroup: 'main60' | 'main40' | 'extra'.
+// Returns entries tagged with deckGroup: 'main60' | 'main40' | 'extra' | 'side'.
 // Handles both "- [ ] Name" / "- ☑ Name" checkbox lines (with or without a
 // count / rarity tag) and bare "- Name" lines. Bare lines (no checkbox) are
 // treated as owned=true (they are the actual deck list).
@@ -262,7 +268,7 @@ function parseCardsFromMarkdown(content) {
     const otherEntries = Array.from(cardMap.values()).filter(e => e.deckGroup === 'other');
     for (const other of otherEntries) {
         if (other.rarity === 'N') continue;
-        for (const g of ['main60', 'main40', 'extra']) {
+        for (const g of ['main60', 'main40', 'extra', 'side']) {
             const key = `${g}:${other.name}`;
             if (cardMap.has(key) && cardMap.get(key).rarity === 'N') {
                 cardMap.set(key, { ...cardMap.get(key), rarity: other.rarity });
@@ -340,6 +346,56 @@ function parseCombosFromMarkdown(content) {
     return combos;
 }
 
+// Parse "Siding Patterns" — named matchups with OUT/IN card lists, used by
+// the Side Deck tab's Apply/Revert siding feature. Lives under a top-level
+// "# ... SIDING PATTERNS" heading; each subheading beneath it (e.g. "## vs
+// Kashtira") is one matchup, followed by an "OUT:" line and an "IN:" line
+// listing comma-separated "Name ×N" cards (count defaults to 1 when omitted).
+// headingLine/outLine/inLine keep the exact original text so
+// update/deleteSidingPattern can find and remove precisely these lines,
+// mirroring how combo.rawText works for combos.
+function parseSidingPatternsFromMarkdown(content) {
+    const lines = splitLines(content);
+    const topIdx = lines.findIndex(l => /^#{1,6}[^\n]*siding[^\n]*patterns?/i.test(l));
+    if (topIdx === -1) return [];
+    const topDepth = (lines[topIdx].match(/^(#{1,6})/) || ['#'])[1].length;
+
+    const parseTokens = (str) => (str || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(tok => {
+            const { name, count } = parseEntryText(tok);
+            return { name, count };
+        });
+
+    const patterns = [];
+    let current = null;
+    for (let i = topIdx + 1; i < lines.length; i++) {
+        const line = lines[i];
+        const hm = line.match(/^(#{1,6})\s+(.*)$/);
+        if (hm) {
+            const depth = hm[1].length;
+            if (depth <= topDepth) break; // end of the SIDING PATTERNS section
+            if (current) patterns.push(current);
+            const title = hm[2].replace(/[*_`]/g, '').trim();
+            current = {
+                matchup: title.replace(/^vs\.?\s+/i, ''),
+                out: [], in: [],
+                headingLine: line, outLine: null, inLine: null,
+            };
+            continue;
+        }
+        if (!current) continue;
+        const outM = line.match(/^\s*OUT\s*:\s*(.*)$/i);
+        if (outM) { current.out = parseTokens(outM[1]); current.outLine = line; continue; }
+        const inM = line.match(/^\s*IN\s*:\s*(.*)$/i);
+        if (inM) { current.in = parseTokens(inM[1]); current.inLine = line; continue; }
+    }
+    if (current) patterns.push(current);
+    return patterns;
+}
+
 // Toggle a combo checkbox in the markdown file
 function updateComboCheckbox(content, rawText, learned) {
     const escaped = rawText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -390,7 +446,7 @@ function appendCardToSection(content, card) {
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
     const typeGroups = computeTypeGroups(lines);
-    const groupKey = ['main60', 'main40', 'extra'].includes(card.deckGroup) ? card.deckGroup : 'main60';
+    const groupKey = ['main60', 'main40', 'extra', 'side'].includes(card.deckGroup) ? card.deckGroup : 'main60';
 
     const rarity = card.rarity || 'N';
     const count = card.count || 1;
@@ -448,6 +504,7 @@ function appendCardToSection(content, card) {
         main60: '# 🟦 MAIN DECK',
         main40: '# 🟢 40-CARD VARIANT',
         extra: '# 🟥 EXTRA DECK',
+        side: '# 🟨 SIDE DECK',
     };
     const trimmed = content.replace(/\s+$/, '');
     return `${trimmed}${eol}${eol}${HEADINGS[groupKey]}${eol}${newLine}${eol}`;
@@ -462,7 +519,7 @@ function upsertCardInTemplate(content, card) {
     const eol = detectEOL(content);
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
-    const groupKey = ['main60', 'main40', 'extra'].includes(card.deckGroup) ? card.deckGroup : 'main60';
+    const groupKey = ['main60', 'main40', 'extra', 'side'].includes(card.deckGroup) ? card.deckGroup : 'main60';
     const target = card.name.trim().toLowerCase();
     const count = card.count || 1;
     const rarity = card.rarity || 'N';
@@ -716,6 +773,19 @@ Use ☑ / ☐ to track ownership or crafting.
 
 ### Traps
 - 
+
+---
+
+# 🟨 SIDE DECK
+- 
+
+---
+
+# 🔄 SIDING PATTERNS
+
+## vs Example Matchup
+OUT: 
+IN: 
 
 ---
 
@@ -1437,9 +1507,11 @@ class DeckUI extends Modal {
     constructor(app, plugin) {
         super(app);
         this.plugin = plugin;
-        this.decks = { main60: [], main40: [], extra: [] };
+        this.decks = { main60: [], main40: [], extra: [], side: [] };
         this.allCards = [];
         this.combos = [];
+        this.sidingPatterns = [];
+        this.appliedSidingPatterns = new Set(); // matchup names currently sided in
         this.comboCardCache = new Map(); // name.toLowerCase() → card object
         this.collectionMap = new Map(); // name.toLowerCase() → { count, rarity } from the collection note
         this.activeTab = 'main60';
@@ -1532,6 +1604,8 @@ class DeckUI extends Modal {
             { key: 'main60', label: '🟦 Main Deck (60)', color: '#60a5fa' },
             { key: 'main40', label: '🟢 40-Card Variant', color: '#4ade80' },
             { key: 'extra', label: '🟥 Extra Deck', color: '#f87171' },
+            { key: 'side', label: '🟨 Side Deck', color: '#facc15' },
+            { key: 'siding', label: '🔄 Siding', color: '#c084f5' },
             { key: 'combos', label: '🧠 Combos', color: '#a78bfa' },
             { key: 'hand', label: '🎲 Test Hand', color: '#e8c84a' },
             { key: 'analysis', label: '📈 Analysis', color: '#f472b6' },
@@ -1788,6 +1862,8 @@ class DeckUI extends Modal {
             main60: '🟦 Main Deck (60)',
             main40: '🟢 40-Card Variant',
             extra: '🟥 Extra Deck',
+            side: '🟨 Side Deck',
+            siding: '🔄 Siding',
             combos: '🧠 Combos',
             hand: '🎲 Test Hand',
             analysis: '📈 Analysis',
@@ -1798,6 +1874,9 @@ class DeckUI extends Modal {
             if (k === 'combos') {
                 const count = (this.combos || []).length;
                 btn.textContent = count > 0 ? `${LABELS[k]} · ${count}` : LABELS[k];
+            } else if (k === 'siding') {
+                const count = (this.sidingPatterns || []).length;
+                btn.textContent = count > 0 ? `${LABELS[k]} · ${count}` : LABELS[k];
             } else {
                 const count = (this.decks[k] || []).length;
                 btn.textContent = count > 0 ? `${LABELS[k]} · ${count}` : LABELS[k];
@@ -1805,6 +1884,12 @@ class DeckUI extends Modal {
             btn.style.color = active ? color : '#6b7280';
             btn.style.borderBottom = active ? `3px solid ${color}` : '3px solid transparent';
             btn.style.background = active ? color + '18' : 'none';
+            // With 8 tabs now (Side Deck + Siding added), the active one can
+            // land past the visible width of the horizontally-scrolling tab
+            // bar — scroll it fully into view instead of leaving it clipped
+            // at the edge (previously only reachable by manually dragging
+            // the scrollbar).
+            if (active) btn.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
         }
         // Re-render content area
         this.grid.empty();
@@ -1824,6 +1909,9 @@ class DeckUI extends Modal {
         } else if (key === 'analysis') {
             this.grid.style.display = 'block';
             this.renderAnalysis(this.grid);
+        } else if (key === 'siding') {
+            this.grid.style.display = 'block';
+            this.renderSidingPatterns(this.grid);
         } else {
             this.grid.style.display = 'grid';
             const cards = this.decks[key] || [];
@@ -2106,6 +2194,344 @@ class DeckUI extends Modal {
         await this.plugin.writeTemplate(updated);
         this.combos = parseCombosFromMarkdown(updated);
         return true;
+    }
+
+    // ── Siding Patterns (Side Deck tab) ─────────────────────────────────────
+    // Saves a new "## vs X / OUT: ... / IN: ..." block right after the top
+    // "SIDING PATTERNS" heading, creating that heading (and the section) at
+    // the end of the note if it doesn't exist yet — same insertion strategy
+    // as saveComboText.
+    async saveSidingPattern(matchup, outText, inText) {
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+
+        const block = `## vs ${matchup}\nOUT: ${outText}\nIN: ${inText}`;
+        const topHeadingRe = /^(#{1,6}[^\n]*siding[^\n]*patterns?[^\n]*)/im;
+
+        let updated;
+        if (topHeadingRe.test(fileContent)) {
+            updated = fileContent.replace(topHeadingRe, (m) => `${m}\n\n${block}\n`);
+        } else {
+            const trimmed = fileContent.replace(/\s+$/, '');
+            updated = `${trimmed}\n\n# 🔄 SIDING PATTERNS\n\n${block}\n`;
+        }
+
+        await this.plugin.writeTemplate(updated);
+        this.sidingPatterns = parseSidingPatternsFromMarkdown(updated);
+        return true;
+    }
+
+    // Edit = delete the old block, then save the new one — simpler and just
+    // as reliable as trying to rewrite three lines in place, since the block
+    // can move around in the file structure between edits anyway.
+    async updateSidingPattern(oldPattern, matchup, outText, inText) {
+        const deleted = await this.deleteSidingPattern(oldPattern);
+        if (!deleted) return false;
+        return this.saveSidingPattern(matchup, outText, inText);
+    }
+
+    async deleteSidingPattern(pattern) {
+        let content = await this.plugin.readTemplate();
+        if (!content) { new Notice('No active file to save to.'); return false; }
+
+        const removeLine = (text, rawLine) => {
+            if (!rawLine) return text;
+            const idx = text.indexOf(rawLine);
+            if (idx === -1) return text;
+            let end = idx + rawLine.length;
+            if (text[end] === '\r' && text[end + 1] === '\n') end += 2;
+            else if (text[end] === '\n') end += 1;
+            return text.slice(0, idx) + text.slice(end);
+        };
+
+        content = removeLine(content, pattern.inLine);
+        content = removeLine(content, pattern.outLine);
+        content = removeLine(content, pattern.headingLine);
+
+        await this.plugin.writeTemplate(content);
+        this.sidingPatterns = parseSidingPatternsFromMarkdown(content);
+        this.appliedSidingPatterns.delete(pattern.matchup);
+        return true;
+    }
+
+    // Moves `qty` copies of named cards between deck zones — the shared move
+    // primitive behind both applying and reverting a siding pattern. Every
+    // card involved is already fully loaded (Main/Extra cards for OUT,
+    // Side Deck cards for IN), so this mutates this.decks/this.allCards
+    // directly instead of a full network reload, and persists the same
+    // moves to the note via decrementCardInTemplate/upsertCardInTemplate.
+    // Validates availability for the WHOLE list before changing anything, so
+    // a pattern that can't fully apply doesn't partially apply.
+    async applySidingChange(outList, inList) {
+        const findInGroups = (name, groups) => this.allCards.find(
+            c => groups.includes(c.deckGroup) && c.name.toLowerCase() === name.toLowerCase()
+        );
+
+        for (const { name, count } of outList) {
+            const entry = findInGroups(name, ['main60', 'extra']);
+            if (!entry || (entry.count || 1) < count) {
+                new Notice(`Can't move ${count}× "${name}" out — not enough copies in Main/Extra.`);
+                return false;
+            }
+        }
+        for (const { name, count } of inList) {
+            const entry = findInGroups(name, ['side']);
+            if (!entry || (entry.count || 1) < count) {
+                new Notice(`Can't move ${count}× "${name}" in — not enough copies in the Side Deck.`);
+                return false;
+            }
+        }
+
+        let content = await this.plugin.readTemplate();
+        if (!content) { new Notice('No active file to save to.'); return false; }
+
+        const moveCard = (name, qty, fromGroup, toGroup) => {
+            const fromArr = this.decks[fromGroup];
+            const idx = fromArr.findIndex(c => c.name.toLowerCase() === name.toLowerCase());
+            const card = fromArr[idx];
+            const newFromCount = (card.count || 1) - qty;
+
+            for (let i = 0; i < qty; i++) {
+                content = decrementCardInTemplate(content, name, fromGroup).content;
+            }
+            if (newFromCount <= 0) {
+                fromArr.splice(idx, 1);
+                this.allCards = this.allCards.filter(c => c !== card);
+            } else {
+                card.count = newFromCount;
+            }
+
+            const toArr = this.decks[toGroup];
+            const existing = toArr.find(c => c.name.toLowerCase() === name.toLowerCase());
+            if (existing) {
+                existing.count = (existing.count || 1) + qty;
+                content = upsertCardInTemplate(content, existing);
+            } else {
+                const copy = { ...card, count: qty, deckGroup: toGroup, owned: true };
+                toArr.push(copy);
+                this.allCards.push(copy);
+                content = upsertCardInTemplate(content, copy);
+            }
+        };
+
+        for (const { name, count } of outList) {
+            const entry = findInGroups(name, ['main60', 'extra']);
+            moveCard(name, count, entry.deckGroup, 'side');
+        }
+        for (const { name, count } of inList) {
+            const entry = findInGroups(name, ['side']);
+            const isExtraType = entry.type && /Fusion|Synchro|Xyz|Link/.test(entry.type);
+            moveCard(name, count, 'side', isExtraType ? 'extra' : 'main60');
+        }
+
+        await this.plugin.writeTemplate(content);
+        return true;
+    }
+
+    // Toggles a siding pattern between applied and reverted. Applying moves
+    // OUT cards Main/Extra→Side and IN cards Side→Main/Extra; reverting does
+    // the exact same move with the lists swapped.
+    async applySidingPattern(pattern) {
+        const isApplied = this.appliedSidingPatterns.has(pattern.matchup);
+        const ok = isApplied
+            ? await this.applySidingChange(pattern.in, pattern.out)
+            : await this.applySidingChange(pattern.out, pattern.in);
+        if (!ok) return false;
+
+        if (isApplied) this.appliedSidingPatterns.delete(pattern.matchup);
+        else this.appliedSidingPatterns.add(pattern.matchup);
+        return true;
+    }
+
+    // ── Side Deck tab: Siding Patterns ──────────────────────────────────────
+    renderSidingPatterns(container) {
+        const patterns = this.sidingPatterns || [];
+        const serializeList = (list) => list.map(({ name, count }) => count > 1 ? `${name} ×${count}` : name).join(', ');
+        const resolveArt = (name) => this.allCards.find(c => c.name.toLowerCase() === name.toLowerCase());
+
+        // ── Controls + Add/Edit form ─────────────────────────────────────────
+        const controls = container.createEl('div');
+        controls.style.cssText = 'display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center;';
+
+        const sideCopies = (this.decks.side || []).reduce((n, c) => n + (c.count || 1), 0);
+        const info = controls.createEl('span');
+        info.style.cssText = 'font-size: 0.75em; color: #6b7280; font-family: monospace; margin-right: auto;';
+        info.textContent = `${patterns.length} siding pattern${patterns.length === 1 ? '' : 's'} · Side Deck: ${sideCopies}/15`;
+
+        const addBtn = this.makeBtn(controls, '+ Add Pattern', '#7c3aed', '#fff');
+
+        const addForm = container.createEl('div');
+        addForm.style.cssText = `
+            display: none; flex-direction: column; gap: 6px; margin-bottom: 16px;
+            padding: 10px; background: #111827; border-radius: 8px; border: 1px solid #1f2937;
+        `;
+        const fieldStyle = `
+            background: #1f2937; border: 1px solid #374151; border-radius: 6px;
+            padding: 7px 10px; color: #e2e8f0; font-size: 0.82em; outline: none; font-family: monospace;
+        `;
+        const matchupInput = addForm.createEl('input');
+        matchupInput.placeholder = 'Matchup name (e.g. Kashtira)…';
+        matchupInput.style.cssText = fieldStyle;
+        const outInput = addForm.createEl('input');
+        outInput.placeholder = 'OUT — comma-separated, e.g. Ash Blossom & Joyous Spring ×2, Called by the Grave';
+        outInput.style.cssText = fieldStyle;
+        const inInput = addForm.createEl('input');
+        inInput.placeholder = 'IN — comma-separated, e.g. Crossout Designator ×2';
+        inInput.style.cssText = fieldStyle;
+        const formBtnRow = addForm.createEl('div');
+        formBtnRow.style.cssText = 'display: flex; gap: 8px;';
+        const saveBtn = this.makeBtn(formBtnRow, '💾 Save Pattern', '#7c3aed', '#fff');
+        const cancelBtn = this.makeBtn(formBtnRow, 'Cancel', '#374151', '#e2e8f0');
+
+        let editingPattern = null;
+        const resetForm = () => {
+            editingPattern = null;
+            matchupInput.value = ''; outInput.value = ''; inInput.value = '';
+            saveBtn.textContent = '💾 Save Pattern';
+            addForm.style.display = 'none';
+        };
+
+        addBtn.onclick = () => {
+            if (addForm.style.display === 'none') { editingPattern = null; addForm.style.display = 'flex'; }
+            else resetForm();
+        };
+        cancelBtn.onclick = () => resetForm();
+        saveBtn.onclick = async () => {
+            const matchup = matchupInput.value.trim();
+            if (!matchup) return new Notice('Enter a matchup name.');
+            const ok = editingPattern
+                ? await this.updateSidingPattern(editingPattern, matchup, outInput.value.trim(), inInput.value.trim())
+                : await this.saveSidingPattern(matchup, outInput.value.trim(), inInput.value.trim());
+            if (!ok) return;
+            const wasEditing = !!editingPattern;
+            resetForm();
+            this.switchTab('siding');
+            this.setStatus(`✅ Siding pattern ${wasEditing ? 'updated' : 'added'}: "vs ${matchup}"`);
+        };
+
+        // ── Pattern list ─────────────────────────────────────────────────────
+        if (patterns.length === 0) {
+            const empty = container.createEl('div');
+            empty.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.85em; padding: 30px 0; text-align: center;';
+            empty.textContent = 'No siding patterns yet — add one for a matchup you play often.';
+            return;
+        }
+
+        const renderChipList = (wrap, list, color) => {
+            for (const { name, count } of list) {
+                const card = resolveArt(name);
+                const chip = wrap.createEl('div');
+                chip.style.cssText = `
+                    display: inline-flex; align-items: center; gap: 4px;
+                    background: ${color}18; border: 1px solid ${color}55; border-radius: 5px;
+                    padding: 2px 7px 2px 2px; font-size: 0.75em; color: ${color}; font-family: monospace;
+                `;
+                if (card?.image) {
+                    const img = chip.createEl('img');
+                    img.src = card.image;
+                    img.style.cssText = 'width: 18px; height: 26px; object-fit: cover; border-radius: 2px;';
+                }
+                chip.appendChild(document.createTextNode(`${name}${count > 1 ? ` ×${count}` : ''}`));
+            }
+        };
+
+        for (const pattern of patterns) {
+            const applied = this.appliedSidingPatterns.has(pattern.matchup);
+            const row = container.createEl('div');
+            row.style.cssText = `
+                background: #111827; border: 1.5px solid ${applied ? '#4ade80' : '#1f2937'};
+                border-radius: 8px; padding: 12px 14px; margin-bottom: 12px;
+            `;
+
+            const headerRow = row.createEl('div');
+            headerRow.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px;';
+
+            const title = headerRow.createEl('div');
+            title.textContent = `vs ${pattern.matchup}${applied ? '  🟢 Sided In' : ''}`;
+            title.style.cssText = `font-family: monospace; font-weight: bold; font-size: 0.9em; color: ${applied ? '#4ade80' : '#e2e8f0'};`;
+
+            const actionsCol = headerRow.createEl('div');
+            actionsCol.style.cssText = 'display: flex; gap: 4px; align-items: center; flex-shrink: 0;';
+
+            const applyBtn = actionsCol.createEl('button');
+            applyBtn.textContent = applied ? '🔙 Revert' : '🔃 Apply Siding';
+            applyBtn.style.cssText = `
+                background: ${applied ? '#374151' : '#7c3aed'}; color: #fff; border: none;
+                padding: 5px 11px; border-radius: 6px; cursor: pointer;
+                font-size: 0.76em; font-family: monospace; font-weight: bold;
+            `;
+            applyBtn.onclick = async () => {
+                applyBtn.disabled = true;
+                const ok = await this.applySidingPattern(pattern);
+                applyBtn.disabled = false;
+                if (!ok) return;
+                this.switchTab('siding');
+                this.setStatus(applied ? `🔙 Reverted siding vs ${pattern.matchup}` : `🔃 Applied siding vs ${pattern.matchup}`);
+            };
+
+            const mkIconBtn = (icon) => {
+                const b = actionsCol.createEl('button');
+                b.textContent = icon;
+                b.style.cssText = `
+                    background: none; border: none; cursor: pointer; font-size: 0.85em;
+                    padding: 3px 6px; border-radius: 4px; opacity: 0.6; transition: opacity .12s;
+                `;
+                b.onmouseenter = () => b.style.opacity = '1';
+                b.onmouseleave = () => { if (!b.dataset.confirming) b.style.opacity = '0.6'; };
+                return b;
+            };
+
+            const editBtn = mkIconBtn('✏️');
+            editBtn.title = 'Edit pattern';
+            editBtn.onclick = () => {
+                editingPattern = pattern;
+                matchupInput.value = pattern.matchup;
+                outInput.value = serializeList(pattern.out);
+                inInput.value = serializeList(pattern.in);
+                saveBtn.textContent = '💾 Save Changes';
+                addForm.style.display = 'flex';
+                addForm.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            };
+
+            const deleteBtn = mkIconBtn('🗑️');
+            deleteBtn.title = 'Delete pattern';
+            deleteBtn.onclick = async () => {
+                if (!deleteBtn.dataset.confirming) {
+                    deleteBtn.dataset.confirming = '1';
+                    deleteBtn.textContent = '❗ confirm';
+                    deleteBtn.style.opacity = '1';
+                    deleteBtn.style.color = '#f87171';
+                    setTimeout(() => {
+                        if (deleteBtn.dataset.confirming) {
+                            delete deleteBtn.dataset.confirming;
+                            deleteBtn.textContent = '🗑️';
+                            deleteBtn.style.opacity = '0.6';
+                            deleteBtn.style.color = '';
+                        }
+                    }, 2500);
+                    return;
+                }
+                const ok = await this.deleteSidingPattern(pattern);
+                if (!ok) return;
+                this.switchTab('siding');
+                this.setStatus(`🗑️ Siding pattern deleted: "vs ${pattern.matchup}"`);
+            };
+
+            const listsWrap = row.createEl('div');
+            listsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
+
+            const outRow = listsWrap.createEl('div');
+            outRow.style.cssText = 'display: flex; flex-wrap: wrap; align-items: center; gap: 5px;';
+            const outLabel = outRow.createEl('span', { text: 'OUT' });
+            outLabel.style.cssText = 'font-size: 0.68em; color: #6b7280; font-family: monospace; font-weight: bold; width: 30px;';
+            renderChipList(outRow, pattern.out, '#f87171');
+
+            const inRow = listsWrap.createEl('div');
+            inRow.style.cssText = 'display: flex; flex-wrap: wrap; align-items: center; gap: 5px;';
+            const inLabel = inRow.createEl('span', { text: 'IN' });
+            inLabel.style.cssText = 'font-size: 0.68em; color: #6b7280; font-family: monospace; font-weight: bold; width: 30px;';
+            renderChipList(inRow, pattern.in, '#4ade80');
+        }
     }
 
     renderCombos(container) {
@@ -2656,8 +3082,10 @@ class DeckUI extends Modal {
             return new Notice(msg);
         }
 
-        // Always reload combos from the latest file content
+        // Always reload combos and siding patterns from the latest file content
         this.combos = parseCombosFromMarkdown(content);
+        this.sidingPatterns = parseSidingPatternsFromMarkdown(content);
+        this.appliedSidingPatterns = new Set();
 
         const entries = parseCardsFromMarkdown(content);
         if (entries.length === 0) {
@@ -2666,7 +3094,7 @@ class DeckUI extends Modal {
             return;
         }
 
-        this.decks = { main60: [], main40: [], extra: [] };
+        this.decks = { main60: [], main40: [], extra: [], side: [] };
         this.allCards = [];
         this.setStatus(`Fetching ${entries.length} unique cards from template…`);
 
@@ -2870,26 +3298,28 @@ class DeckUI extends Modal {
         this.switchTab(this.activeTab);
     }
 
-    // Checks main/extra deck sizes and per-card Master Duel copy limits.
+    // Checks main/extra/side deck sizes and per-card Master Duel copy limits.
     // Uses the 40-card variant as "the main deck" when it has cards (since
     // that's a deliberate, exact-40 build), otherwise the 40–60 main deck.
-    // Copy limits are checked against main+extra combined (Side Deck isn't
-    // tracked by this plugin, so it's excluded).
+    // Copy limits are checked against main+extra+side combined, since a real
+    // Master Duel/TCG copy limit spans all three zones together.
     validateDeck() {
         // Validate whichever main-deck tab the user is currently viewing.
-        // If they're on a non-deck tab (Extra/Combos/Test Hand), default to
-        // the primary 60-card Main Deck — not the 40-card variant — since
+        // If they're on a non-deck tab (Extra/Side/Combos/Test Hand), default
+        // to the primary 60-card Main Deck — not the 40-card variant — since
         // that's the deck being built unless the user is actively looking
         // at the variant tab.
         const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
         const mainKey = onDeckTab ? this.activeTab : 'main60';
         const mainCards = this.decks[mainKey];
         const extraCards = this.decks.extra;
+        const sideCards = this.decks.side || [];
 
         const sumCopies = cards => cards.reduce((n, c) => n + (c.count || 1), 0);
         const mainCount = sumCopies(mainCards);
         const extraCount = sumCopies(extraCards);
-        const mainMin = 40, mainMax = mainKey === 'main40' ? 40 : 60, extraMax = 15;
+        const sideCount = sumCopies(sideCards);
+        const mainMin = 40, mainMax = mainKey === 'main40' ? 40 : 60, extraMax = 15, sideMax = 15;
 
         const errors = [], warnings = [];
         if (mainCount < mainMin || mainCount > mainMax) {
@@ -2898,9 +3328,12 @@ class DeckUI extends Modal {
         if (extraCount > extraMax) {
             errors.push(`Extra Deck has ${extraCount} cards (max ${extraMax})`);
         }
+        if (sideCount > sideMax) {
+            errors.push(`Side Deck has ${sideCount} cards (max ${sideMax})`);
+        }
 
-        const combined = new Map(); // name -> { total copies across main+extra, konami_id }
-        for (const c of [...mainCards, ...extraCards]) {
+        const combined = new Map(); // name -> { total copies across main+extra+side, konami_id }
+        for (const c of [...mainCards, ...extraCards, ...sideCards]) {
             const prev = combined.get(c.name);
             combined.set(c.name, { total: (prev?.total || 0) + (c.count || 1), konami_id: c.konami_id });
         }
@@ -2909,14 +3342,14 @@ class DeckUI extends Modal {
             const limit = BANLIST_COPY_LIMIT[status] ?? 3;
             if (total > limit) {
                 errors.push(limit === 0
-                    ? `"${name}" is Forbidden in Master Duel (×${total} in deck)`
-                    : `"${name}" exceeds its Master Duel limit — ${status}: ${total}/${limit}`);
+                    ? `"${name}" is Forbidden in Master Duel (×${total} across Main/Extra/Side)`
+                    : `"${name}" exceeds its Master Duel limit — ${status}: ${total}/${limit} across Main/Extra/Side`);
             } else if (status !== 'Unlimited') {
                 warnings.push(`"${name}" is ${status} in Master Duel (${total}/${limit})`);
             }
         }
 
-        return { mainKey, mainCount, mainMin, mainMax, extraCount, extraMax, errors, warnings };
+        return { mainKey, mainCount, mainMin, mainMax, extraCount, extraMax, sideCount, sideMax, errors, warnings };
     }
 
     showValidation() {
@@ -2928,6 +3361,7 @@ class DeckUI extends Modal {
             '─────────────────',
             `${r.mainKey === 'main40' ? 'Main Deck (40)' : 'Main Deck'}   ${r.mainCount} / ${r.mainMax}`,
             `Extra Deck      ${r.extraCount} / ${r.extraMax}`,
+            `Side Deck       ${r.sideCount} / ${r.sideMax}`,
         ];
         if (r.errors.length) {
             lines.push('', 'Errors:');
@@ -2955,7 +3389,7 @@ class DeckUI extends Modal {
 
         const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
         const mainKey = onDeckTab ? this.activeTab : 'main60';
-        const cards = [...this.decks[mainKey], ...this.decks.extra];
+        const cards = [...this.decks[mainKey], ...this.decks.extra, ...(this.decks.side || [])];
 
         const needed = new Map(); // name -> { need, rarity }
         for (const c of cards) {
@@ -3276,8 +3710,11 @@ class DeckUI extends Modal {
             const success = await this.plugin.writeTemplate(DECK_TEMPLATE);
             if (success) {
                 // Reset UI state — the note is now a blank template
-                this.decks = { main60: [], main40: [], extra: [] };
+                this.decks = { main60: [], main40: [], extra: [], side: [] };
                 this.allCards = [];
+                this.combos = [];
+                this.sidingPatterns = [];
+                this.appliedSidingPatterns = new Set();
                 this.switchTab(this.activeTab);
                 this.setStatus(`✅ Template applied to "${file.name}". Fill in your deck and hit 🔄 Reload.`);
                 new Notice(`✅ Blank template applied to "${file.name}"`);
