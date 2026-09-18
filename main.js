@@ -3389,40 +3389,58 @@ class DeckUI extends Modal {
             return new Notice(`⚠️ No collection data loaded. Set up "${this.plugin.settings.collectionNotePath}" (Settings → 📦 Create Collection Note) first.`);
         }
 
+        // Two separate shopping lists, not one combined pool — Main Deck (60)
+        // and the 40-Card Variant are alternate builds, each paired with the
+        // shared Extra Deck rather than summed together (that previously made
+        // "need" look inflated when a card only belonged to one build). Side
+        // Deck stays excluded from both: its cards are meant to be the same
+        // physical copies as Main/Extra, moved via Apply Siding, not extra
+        // copies to own on top.
+        const buildReport = (cards) => {
+            const needed = new Map(); // name -> { need, rarity }
+            for (const c of cards) {
+                const prev = needed.get(c.name);
+                needed.set(c.name, { need: (prev?.need || 0) + (c.count || 1), rarity: c.rarity });
+            }
+            const missing = [];
+            const byRarity = { UR: 0, SR: 0, R: 0, N: 0 };
+            for (const [name, { need, rarity }] of needed) {
+                const have = this.collectionMap.get(name.toLowerCase())?.count || 0;
+                const short = need - have;
+                if (short > 0) {
+                    missing.push(`${name} [${rarity}]  need ${short} more`);
+                    byRarity[rarity in byRarity ? rarity : 'N'] += short;
+                }
+            }
+            return { missing, byRarity };
+        };
         // Same "last-viewed main deck tab" logic as validateDeck() — Craft
         // List is also a toolbar button visible from every tab.
         const mainKey = this.lastMainDeckTab;
         const cards = [...this.decks[mainKey], ...this.decks.extra, ...(this.decks.side || [])];
 
-        const needed = new Map(); // name -> { need, rarity }
-        for (const c of cards) {
-            const prev = needed.get(c.name);
-            needed.set(c.name, { need: (prev?.need || 0) + (c.count || 1), rarity: c.rarity });
-        }
+        const mainReport = buildReport([...this.decks.main60, ...this.decks.extra]);
+        const variantReport = buildReport([...this.decks.main40, ...this.decks.extra]);
 
-        const missing = [];
-        const byRarity = { UR: 0, SR: 0, R: 0, N: 0 };
-        for (const [name, { need, rarity }] of needed) {
-            const have = this.collectionMap.get(name.toLowerCase())?.count || 0;
-            const short = need - have;
-            if (short > 0) {
-                missing.push(`${name} [${rarity}]  need ${short} more`);
-                byRarity[rarity in byRarity ? rarity : 'N'] += short;
+        const sections = [];
+        const addSection = (title, report) => {
+            if (report.missing.length === 0) {
+                sections.push(`${title}\n✅ You already own every card here!`);
+            } else {
+                sections.push([
+                    `${title} — MISSING (${report.missing.length} cards)`,
+                    '─────────────────',
+                    ...report.missing,
+                    '',
+                    `Crafting: ◆ UR ${report.byRarity.UR}  ◇ SR ${report.byRarity.SR}  ● R ${report.byRarity.R}  ○ N ${report.byRarity.N}`,
+                ].join('\n'));
             }
-        }
+        };
 
-        if (missing.length === 0) {
-            return new Notice('✅ You already own every card in this deck!');
-        }
+        addSection('📦 MAIN DECK (60) + EXTRA', mainReport);
+        addSection('📦 40-CARD VARIANT + EXTRA', variantReport);
 
-        const lines = [
-            `📦 MISSING FROM COLLECTION (${missing.length} cards)`,
-            '─────────────────',
-            ...missing,
-            '',
-            `Crafting: ◆ UR ${byRarity.UR}  ◇ SR ${byRarity.SR}  ● R ${byRarity.R}  ○ N ${byRarity.N}`
-        ];
-        new Notice(lines.join('\n'), 20000);
+        new Notice(sections.join('\n\n'), 20000);
     }
 
     showStats() {
