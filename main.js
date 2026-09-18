@@ -1515,6 +1515,7 @@ class DeckUI extends Modal {
         this.comboCardCache = new Map(); // name.toLowerCase() → card object
         this.collectionMap = new Map(); // name.toLowerCase() → { count, rarity } from the collection note
         this.activeTab = 'main60';
+        this.lastMainDeckTab = 'main60'; // tracks whichever of Main60/Main40 was last viewed, since Test Hand/Validate/Craft List need to know which one to act on even when a different tab is active
         this.analysisDeck = null; // resolved lazily on first visit to the Analysis tab
         this.loading = false;
     }
@@ -1858,6 +1859,7 @@ class DeckUI extends Modal {
 
     switchTab(key) {
         this.activeTab = key;
+        if (key === 'main60' || key === 'main40') this.lastMainDeckTab = key;
         const LABELS = {
             main60: '🟦 Main Deck (60)',
             main40: '🟢 40-Card Variant',
@@ -1929,11 +1931,14 @@ class DeckUI extends Modal {
     }
 
     // ── Opening Hand Simulator ──────────────────────────────────────────────
-    // Draws from the 40-card variant if it has cards (an exact, fixed pool),
-    // otherwise the 40–60 Main Deck. Extra Deck is never drawn from.
+    // Draws from whichever of Main Deck (60) / 40-Card Variant was last
+    // viewed (this.lastMainDeckTab) — not "the variant, whenever it happens
+    // to have any cards", since a note commonly keeps both checklists
+    // populated side by side and that silently locked Test Hand onto the
+    // variant even when the user was building/testing the 60-card deck.
+    // Extra Deck and Side Deck are never drawn from.
     buildDrawPool() {
-        const hasVariant = this.decks.main40.length > 0;
-        const mainCards = hasVariant ? this.decks.main40 : this.decks.main60;
+        const mainCards = this.decks[this.lastMainDeckTab] || this.decks.main60;
         const pool = [];
         for (const c of mainCards) {
             const copies = c.count || 1;
@@ -1953,7 +1958,7 @@ class DeckUI extends Modal {
 
     renderHandSimulator(container) {
         const pool = this.buildDrawPool();
-        const usingVariant = this.decks.main40.length > 0;
+        const usingVariant = this.lastMainDeckTab === 'main40';
 
         const controls = container.createEl('div');
         controls.style.cssText = `
@@ -3299,18 +3304,15 @@ class DeckUI extends Modal {
     }
 
     // Checks main/extra/side deck sizes and per-card Master Duel copy limits.
-    // Uses the 40-card variant as "the main deck" when it has cards (since
-    // that's a deliberate, exact-40 build), otherwise the 40–60 main deck.
+    // Acts on whichever of Main Deck (60) / 40-Card Variant was last viewed
+    // (this.lastMainDeckTab) — Validate/Craft List are toolbar buttons
+    // visible from every tab, so checking this.activeTab directly meant
+    // clicking them from Extra/Combos/Test Hand/etc always silently fell
+    // back to Main 60, even right after viewing the 40-Card Variant tab.
     // Copy limits are checked against main+extra+side combined, since a real
     // Master Duel/TCG copy limit spans all three zones together.
     validateDeck() {
-        // Validate whichever main-deck tab the user is currently viewing.
-        // If they're on a non-deck tab (Extra/Side/Combos/Test Hand), default
-        // to the primary 60-card Main Deck — not the 40-card variant — since
-        // that's the deck being built unless the user is actively looking
-        // at the variant tab.
-        const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
-        const mainKey = onDeckTab ? this.activeTab : 'main60';
+        const mainKey = this.lastMainDeckTab;
         const mainCards = this.decks[mainKey];
         const extraCards = this.decks.extra;
         const sideCards = this.decks.side || [];
@@ -3387,8 +3389,9 @@ class DeckUI extends Modal {
             return new Notice(`⚠️ No collection data loaded. Set up "${this.plugin.settings.collectionNotePath}" (Settings → 📦 Create Collection Note) first.`);
         }
 
-        const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
-        const mainKey = onDeckTab ? this.activeTab : 'main60';
+        // Same "last-viewed main deck tab" logic as validateDeck() — Craft
+        // List is also a toolbar button visible from every tab.
+        const mainKey = this.lastMainDeckTab;
         const cards = [...this.decks[mainKey], ...this.decks.extra, ...(this.decks.side || [])];
 
         const needed = new Map(); // name -> { need, rarity }
@@ -3455,7 +3458,7 @@ class DeckUI extends Modal {
     // counts. Extra Deck is excluded (see classifyCardRole).
     renderAnalysis(container) {
         if (!this.analysisDeck) {
-            this.analysisDeck = this.decks.main40.length > 0 ? 'main40' : 'main60';
+            this.analysisDeck = this.lastMainDeckTab; // same "last viewed" default as Test Hand/Validate/Craft List, not "the variant, if it happens to be non-empty"
         }
 
         const controls = container.createEl('div');
