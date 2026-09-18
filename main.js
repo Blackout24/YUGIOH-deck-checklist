@@ -74,6 +74,12 @@ function explicitGroup(heading) {
     // Extra deck top-level block
     if (/\bextra\s*deck\b/.test(h)) return 'extra';
 
+    // Side deck top-level block — must run before the generic main-deck check
+    // below (a heading like "Side Deck (15)" doesn't contain "main deck" so
+    // order doesn't strictly matter here, but keeping deck-zone checks
+    // together avoids future ambiguity).
+    if (/\bside\s*deck\b/.test(h)) return 'side';
+
     // Extra deck card types as standalone short headings (e.g. "## 🔥 Fusion")
     const stripped = h.replace(/\s+/g, ' ').trim();
     if (/^[#\s]*(fusion|link|xyz|synchro|pendulum|ritual)\s*(\(\d+\))?\s*$/.test(stripped)) return 'extra';
@@ -221,7 +227,7 @@ function parseEntryText(raw) {
 const SKIP_WORDS = ['additional', 'budget', 'tech', 'none', 'optional', 'cards'];
 
 // Parse cards from markdown - section-aware, dual-format.
-// Returns entries tagged with deckGroup: 'main60' | 'main40' | 'extra'.
+// Returns entries tagged with deckGroup: 'main60' | 'main40' | 'extra' | 'side'.
 // Handles both "- [ ] Name" / "- ☑ Name" checkbox lines (with or without a
 // count / rarity tag) and bare "- Name" lines. Bare lines (no checkbox) are
 // treated as owned=true (they are the actual deck list).
@@ -262,7 +268,7 @@ function parseCardsFromMarkdown(content) {
     const otherEntries = Array.from(cardMap.values()).filter(e => e.deckGroup === 'other');
     for (const other of otherEntries) {
         if (other.rarity === 'N') continue;
-        for (const g of ['main60', 'main40', 'extra']) {
+        for (const g of ['main60', 'main40', 'extra', 'side']) {
             const key = `${g}:${other.name}`;
             if (cardMap.has(key) && cardMap.get(key).rarity === 'N') {
                 cardMap.set(key, { ...cardMap.get(key), rarity: other.rarity });
@@ -340,6 +346,56 @@ function parseCombosFromMarkdown(content) {
     return combos;
 }
 
+// Parse "Siding Patterns" — named matchups with OUT/IN card lists, used by
+// the Side Deck tab's Apply/Revert siding feature. Lives under a top-level
+// "# ... SIDING PATTERNS" heading; each subheading beneath it (e.g. "## vs
+// Kashtira") is one matchup, followed by an "OUT:" line and an "IN:" line
+// listing comma-separated "Name ×N" cards (count defaults to 1 when omitted).
+// headingLine/outLine/inLine keep the exact original text so
+// update/deleteSidingPattern can find and remove precisely these lines,
+// mirroring how combo.rawText works for combos.
+function parseSidingPatternsFromMarkdown(content) {
+    const lines = splitLines(content);
+    const topIdx = lines.findIndex(l => /^#{1,6}[^\n]*siding[^\n]*patterns?/i.test(l));
+    if (topIdx === -1) return [];
+    const topDepth = (lines[topIdx].match(/^(#{1,6})/) || ['#'])[1].length;
+
+    const parseTokens = (str) => (str || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(tok => {
+            const { name, count } = parseEntryText(tok);
+            return { name, count };
+        });
+
+    const patterns = [];
+    let current = null;
+    for (let i = topIdx + 1; i < lines.length; i++) {
+        const line = lines[i];
+        const hm = line.match(/^(#{1,6})\s+(.*)$/);
+        if (hm) {
+            const depth = hm[1].length;
+            if (depth <= topDepth) break; // end of the SIDING PATTERNS section
+            if (current) patterns.push(current);
+            const title = hm[2].replace(/[*_`]/g, '').trim();
+            current = {
+                matchup: title.replace(/^vs\.?\s+/i, ''),
+                out: [], in: [],
+                headingLine: line, outLine: null, inLine: null,
+            };
+            continue;
+        }
+        if (!current) continue;
+        const outM = line.match(/^\s*OUT\s*:\s*(.*)$/i);
+        if (outM) { current.out = parseTokens(outM[1]); current.outLine = line; continue; }
+        const inM = line.match(/^\s*IN\s*:\s*(.*)$/i);
+        if (inM) { current.in = parseTokens(inM[1]); current.inLine = line; continue; }
+    }
+    if (current) patterns.push(current);
+    return patterns;
+}
+
 // Toggle a combo checkbox in the markdown file
 function updateComboCheckbox(content, rawText, learned) {
     const escaped = rawText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -390,7 +446,7 @@ function appendCardToSection(content, card) {
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
     const typeGroups = computeTypeGroups(lines);
-    const groupKey = ['main60', 'main40', 'extra'].includes(card.deckGroup) ? card.deckGroup : 'main60';
+    const groupKey = ['main60', 'main40', 'extra', 'side'].includes(card.deckGroup) ? card.deckGroup : 'main60';
 
     const rarity = card.rarity || 'N';
     const count = card.count || 1;
@@ -448,6 +504,7 @@ function appendCardToSection(content, card) {
         main60: '# 🟦 MAIN DECK',
         main40: '# 🟢 40-CARD VARIANT',
         extra: '# 🟥 EXTRA DECK',
+        side: '# 🟨 SIDE DECK',
     };
     const trimmed = content.replace(/\s+$/, '');
     return `${trimmed}${eol}${eol}${HEADINGS[groupKey]}${eol}${newLine}${eol}`;
@@ -462,7 +519,7 @@ function upsertCardInTemplate(content, card) {
     const eol = detectEOL(content);
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
-    const groupKey = ['main60', 'main40', 'extra'].includes(card.deckGroup) ? card.deckGroup : 'main60';
+    const groupKey = ['main60', 'main40', 'extra', 'side'].includes(card.deckGroup) ? card.deckGroup : 'main60';
     const target = card.name.trim().toLowerCase();
     const count = card.count || 1;
     const rarity = card.rarity || 'N';
@@ -716,6 +773,19 @@ Use ☑ / ☐ to track ownership or crafting.
 
 ### Traps
 - 
+
+---
+
+# 🟨 SIDE DECK
+- 
+
+---
+
+# 🔄 SIDING PATTERNS
+
+## vs Example Matchup
+OUT: 
+IN: 
 
 ---
 
@@ -1437,12 +1507,15 @@ class DeckUI extends Modal {
     constructor(app, plugin) {
         super(app);
         this.plugin = plugin;
-        this.decks = { main60: [], main40: [], extra: [] };
+        this.decks = { main60: [], main40: [], extra: [], side: [] };
         this.allCards = [];
         this.combos = [];
+        this.sidingPatterns = [];
+        this.appliedSidingPatterns = new Set(); // matchup names currently sided in
         this.comboCardCache = new Map(); // name.toLowerCase() → card object
         this.collectionMap = new Map(); // name.toLowerCase() → { count, rarity } from the collection note
         this.activeTab = 'main60';
+        this.lastMainDeckTab = 'main60'; // tracks whichever of Main60/Main40 was last viewed, since Test Hand/Validate/Craft List need to know which one to act on even when a different tab is active
         this.analysisDeck = null; // resolved lazily on first visit to the Analysis tab
         this.loading = false;
     }
@@ -1532,6 +1605,8 @@ class DeckUI extends Modal {
             { key: 'main60', label: '🟦 Main Deck (60)', color: '#60a5fa' },
             { key: 'main40', label: '🟢 40-Card Variant', color: '#4ade80' },
             { key: 'extra', label: '🟥 Extra Deck', color: '#f87171' },
+            { key: 'side', label: '🟨 Side Deck', color: '#facc15' },
+            { key: 'siding', label: '🔄 Siding', color: '#c084f5' },
             { key: 'combos', label: '🧠 Combos', color: '#a78bfa' },
             { key: 'hand', label: '🎲 Test Hand', color: '#e8c84a' },
             { key: 'analysis', label: '📈 Analysis', color: '#f472b6' },
@@ -1673,14 +1748,33 @@ class DeckUI extends Modal {
             // Split on arrows to get individual step phrases
             const parts = combo.text.split(/→|->|➜/).map(s => s.trim()).filter(Boolean);
             // Generic action/connector words that are never a card name on their own —
-            // skip fuzzy-searching these to cut down noisy, useless API calls.
+            // skip fuzzy-searching these to cut down noisy, useless API calls, and strip
+            // them off the edges of a whole step phrase before fuzzy-searching that
+            // phrase verbatim (see stripStopwordEdges below).
             const STOPWORDS = new Set([
                 'mill', 'draw', 'dump', 'loop', 'setup', 'route', 'line', 'board',
                 'break', 'up', 'negate', 'summon', 'timing', 'pop', 'extender',
                 'the', 'and', 'of', 'in', 'to', 'for', 'on', 'at', 'as', 'or',
+                'set', 'activate', 'discard', 'banish', 'tribute', 'flip', 'target',
+                'return', 'add', 'send', 'shuffle', 'reveal', 'destroy', 'special', 'normal',
             ]);
+            // A step like "Set Tidying" fuzzy-searched verbatim can match some
+            // unrelated card whose name happens to score closer to the whole
+            // phrase than the real target does (e.g. "Set Tidying" → "Aquarium
+            // Set" instead of "Dragonmaid Tidying") — and because that wrong
+            // match gets cached under the exact key "set tidying", it then
+            // shadows the correct per-word fallback at render time. Strip
+            // leading/trailing action verbs before a phrase is used as a
+            // whole-phrase fuzzy-search candidate; the per-word windows below
+            // still cover the untouched original text.
+            const stripStopwordEdges = (phrase) => {
+                let w = phrase.split(/\s+/);
+                while (w.length > 1 && STOPWORDS.has(w[0].toLowerCase())) w = w.slice(1);
+                while (w.length > 1 && STOPWORDS.has(w[w.length - 1].toLowerCase())) w = w.slice(0, -1);
+                return w.join(' ');
+            };
             for (const part of parts) {
-                stepSet.add(part);
+                stepSet.add(stripStopwordEdges(part));
                 // A card name can sit anywhere in a phrase, with notes before or after
                 // it ("mill Tidying + Changeover setup", "Accesscode OTK route") — add
                 // every contiguous word-window so the card name surfaces on its own,
@@ -1704,7 +1798,8 @@ class DeckUI extends Modal {
                 const subParts = part.split(/[/+]/).map(s => s.trim()).filter(Boolean);
                 if (subParts.length > 1) {
                     for (const sub of subParts) {
-                        if (sub.length >= 3) stepSet.add(sub);
+                        const coreSub = stripStopwordEdges(sub);
+                        if (coreSub.length >= 3) stepSet.add(coreSub);
                         addWindows(sub);
                     }
                 }
@@ -1764,10 +1859,13 @@ class DeckUI extends Modal {
 
     switchTab(key) {
         this.activeTab = key;
+        if (key === 'main60' || key === 'main40') this.lastMainDeckTab = key;
         const LABELS = {
             main60: '🟦 Main Deck (60)',
             main40: '🟢 40-Card Variant',
             extra: '🟥 Extra Deck',
+            side: '🟨 Side Deck',
+            siding: '🔄 Siding',
             combos: '🧠 Combos',
             hand: '🎲 Test Hand',
             analysis: '📈 Analysis',
@@ -1778,6 +1876,9 @@ class DeckUI extends Modal {
             if (k === 'combos') {
                 const count = (this.combos || []).length;
                 btn.textContent = count > 0 ? `${LABELS[k]} · ${count}` : LABELS[k];
+            } else if (k === 'siding') {
+                const count = (this.sidingPatterns || []).length;
+                btn.textContent = count > 0 ? `${LABELS[k]} · ${count}` : LABELS[k];
             } else {
                 const count = (this.decks[k] || []).length;
                 btn.textContent = count > 0 ? `${LABELS[k]} · ${count}` : LABELS[k];
@@ -1785,6 +1886,12 @@ class DeckUI extends Modal {
             btn.style.color = active ? color : '#6b7280';
             btn.style.borderBottom = active ? `3px solid ${color}` : '3px solid transparent';
             btn.style.background = active ? color + '18' : 'none';
+            // With 8 tabs now (Side Deck + Siding added), the active one can
+            // land past the visible width of the horizontally-scrolling tab
+            // bar — scroll it fully into view instead of leaving it clipped
+            // at the edge (previously only reachable by manually dragging
+            // the scrollbar).
+            if (active) btn.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
         }
         // Re-render content area
         this.grid.empty();
@@ -1804,6 +1911,9 @@ class DeckUI extends Modal {
         } else if (key === 'analysis') {
             this.grid.style.display = 'block';
             this.renderAnalysis(this.grid);
+        } else if (key === 'siding') {
+            this.grid.style.display = 'block';
+            this.renderSidingPatterns(this.grid);
         } else {
             this.grid.style.display = 'grid';
             const cards = this.decks[key] || [];
@@ -1821,11 +1931,14 @@ class DeckUI extends Modal {
     }
 
     // ── Opening Hand Simulator ──────────────────────────────────────────────
-    // Draws from the 40-card variant if it has cards (an exact, fixed pool),
-    // otherwise the 40–60 Main Deck. Extra Deck is never drawn from.
+    // Draws from whichever of Main Deck (60) / 40-Card Variant was last
+    // viewed (this.lastMainDeckTab) — not "the variant, whenever it happens
+    // to have any cards", since a note commonly keeps both checklists
+    // populated side by side and that silently locked Test Hand onto the
+    // variant even when the user was building/testing the 60-card deck.
+    // Extra Deck and Side Deck are never drawn from.
     buildDrawPool() {
-        const hasVariant = this.decks.main40.length > 0;
-        const mainCards = hasVariant ? this.decks.main40 : this.decks.main60;
+        const mainCards = this.decks[this.lastMainDeckTab] || this.decks.main60;
         const pool = [];
         for (const c of mainCards) {
             const copies = c.count || 1;
@@ -1845,7 +1958,7 @@ class DeckUI extends Modal {
 
     renderHandSimulator(container) {
         const pool = this.buildDrawPool();
-        const usingVariant = this.decks.main40.length > 0;
+        const usingVariant = this.lastMainDeckTab === 'main40';
 
         const controls = container.createEl('div');
         controls.style.cssText = `
@@ -1861,6 +1974,8 @@ class DeckUI extends Modal {
         const draw5Btn = this.makeBtn(controls, '🎲 Draw 5 · Going First', '#e8c84a', '#0d0f1a');
         const draw6Btn = this.makeBtn(controls, '🎲 Draw 6 · Going Second', '#c084f5', '#fff');
         const redrawBtn = this.makeBtn(controls, '🔄 Redraw', '#60a5fa', '#fff');
+        const consistency5Btn = this.makeBtn(controls, '📊 10k Hands (5)', '#4ade80', '#0d0f1a');
+        const consistency6Btn = this.makeBtn(controls, '📊 10k Hands (6)', '#4ade80', '#0d0f1a');
 
         const handWrap = container.createEl('div');
         handWrap.style.cssText = 'display: flex; gap: 10px; flex-wrap: wrap; padding: 6px 0;';
@@ -1896,7 +2011,106 @@ class DeckUI extends Modal {
         draw6Btn.onclick = () => doDraw(6);
         redrawBtn.onclick = () => doDraw(this.lastHandSize || 5);
 
+        // ── Consistency Test — thousands of simulated opening hands ──────────
+        const resultsWrap = container.createEl('div');
+        resultsWrap.style.cssText = 'margin-top: 18px; padding-top: 14px; border-top: 1px solid #1f2937; display: none;';
+
+        const runConsistency = (handSize) => {
+            if (pool.length === 0) { new Notice('No main deck cards to draw from — load a deck first.'); return; }
+            const btn = handSize === 5 ? consistency5Btn : consistency6Btn;
+            const originalLabel = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ Running…';
+            // Defer one tick so the "Running…" label actually paints before the
+            // (synchronous) simulation loop blocks the thread.
+            setTimeout(() => {
+                const stats = this.runConsistencyTest(pool, handSize, 10000);
+                this.renderConsistencyResults(resultsWrap, stats, handSize);
+                btn.disabled = false;
+                btn.textContent = originalLabel;
+            }, 10);
+        };
+        consistency5Btn.onclick = () => runConsistency(5);
+        consistency6Btn.onclick = () => runConsistency(6);
+
         renderHand();
+    }
+
+    // Simulates `trials` opening hands drawn from `pool` (already copies-
+    // weighted by buildDrawPool) without replacement per hand, classifying
+    // each card with the same classifyCardRole() heuristic the Analysis tab
+    // uses. A card's role never changes between copies, so it's cached by
+    // name to avoid redundantly re-running the regex checks per copy.
+    runConsistencyTest(pool, handSize, trials = 10000) {
+        const roleCache = new Map();
+        const getRole = (card) => {
+            if (!roleCache.has(card.name)) roleCache.set(card.name, classifyCardRole(card).role);
+            return roleCache.get(card.name);
+        };
+
+        let starterHands = 0, extenderHands = 0, handtrapHands = 0, brickHands = 0, playableHands = 0;
+        let starterTotal = 0;
+
+        for (let t = 0; t < trials; t++) {
+            const hand = this.shuffleSample(pool, handSize);
+            let starters = 0, hasExtender = false, hasHandtrap = false, hasNonBrick = false;
+            for (const card of hand) {
+                const role = getRole(card);
+                if (role === 'starter') { starters++; hasNonBrick = true; }
+                else if (role === 'extender') { hasExtender = true; hasNonBrick = true; }
+                else if (role === 'handtrap') { hasHandtrap = true; hasNonBrick = true; }
+                else if (role !== 'brick') { hasNonBrick = true; } // generic "other" staples still count as non-dead
+            }
+            if (starters > 0) starterHands++;
+            if (hasExtender) extenderHands++;
+            if (hasHandtrap) handtrapHands++;
+            if (!hasNonBrick) brickHands++; // every card in hand classified as brick
+            if (starters > 0 || hasHandtrap) playableHands++;
+            starterTotal += starters;
+        }
+
+        return {
+            trials, handSize,
+            starterPct: (starterHands / trials) * 100,
+            extenderPct: (extenderHands / trials) * 100,
+            handtrapPct: (handtrapHands / trials) * 100,
+            brickPct: (brickHands / trials) * 100,
+            playablePct: (playableHands / trials) * 100,
+            avgStarters: starterTotal / trials,
+        };
+    }
+
+    renderConsistencyResults(resultsWrap, stats, handSize) {
+        resultsWrap.style.display = 'block';
+        resultsWrap.empty();
+
+        const heading = resultsWrap.createEl('div');
+        heading.textContent = `📊 Consistency — ${stats.trials.toLocaleString()} hands of ${handSize}`;
+        heading.style.cssText = 'font-family: monospace; font-size: 0.85em; font-weight: bold; color: #4ade80; margin-bottom: 10px;';
+
+        const rows = [
+            ['🟢 Starter in hand', stats.starterPct, '#4ade80'],
+            ['🔵 Extender in hand', stats.extenderPct, '#60a5fa'],
+            ['🪤 Hand trap in hand', stats.handtrapPct, '#f87171'],
+            ['✅ Playable hand (starter or hand trap)', stats.playablePct, '#facc15'],
+            ['🟤 Brick (dead hand)', stats.brickPct, '#a8a29e'],
+        ];
+        for (const [label, pct, color] of rows) {
+            const row = resultsWrap.createEl('div');
+            row.style.cssText = 'margin-bottom: 8px;';
+            const labelRow = row.createEl('div');
+            labelRow.style.cssText = 'display: flex; justify-content: space-between; font-family: monospace; font-size: 0.8em; color: #cbd5e1; margin-bottom: 3px;';
+            labelRow.createEl('span', { text: label });
+            labelRow.createEl('span', { text: `${pct.toFixed(1)}%` });
+            const barBg = row.createEl('div');
+            barBg.style.cssText = 'height: 8px; background: #1f2937; border-radius: 4px; overflow: hidden;';
+            const barFill = barBg.createEl('div');
+            barFill.style.cssText = `height: 100%; width: ${pct}%; background: ${color}; border-radius: 4px; transition: width .4s;`;
+        }
+
+        const avgLine = resultsWrap.createEl('div');
+        avgLine.style.cssText = 'font-family: monospace; font-size: 0.78em; color: #94a3b8; margin-top: 6px;';
+        avgLine.textContent = `Average starters per hand: ${stats.avgStarters.toFixed(2)}`;
     }
 
     // Lightweight, non-interactive card tile for the hand simulator — unlike
@@ -1927,6 +2141,401 @@ class DeckUI extends Modal {
             const tag = wrap.createEl('div');
             tag.textContent = '🪤 Hand Trap';
             tag.style.cssText = 'font-size: 0.54em; color: #facc15; margin-top: 2px; font-family: monospace;';
+        }
+    }
+
+    // Shared by the quick-add text form and ComboBuilderUI — appends a combo
+    // line under a matching category heading (or the first COMBO section, or
+    // a brand-new section if neither exists), reparses this.combos, and
+    // returns whether it succeeded so callers can decide what to do next.
+    async saveComboText(text, cat, categories) {
+        const category = (cat && cat.trim()) || categories?.[0] || 'General';
+        const newLine = `- [ ] ${text}`;
+
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+
+        let updated = fileContent;
+        const catHeadingRe = new RegExp(`(^#{1,6}[^\\n]*${category.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*)`, 'im');
+        const comboHeadingRe = /^(#{1,6}[^\n]*\bcombo\b[^\n]*)/im;
+
+        if (catHeadingRe.test(updated)) {
+            updated = updated.replace(catHeadingRe, (m) => `${m}\n${newLine}`);
+        } else if (comboHeadingRe.test(updated)) {
+            updated = updated.replace(comboHeadingRe, (m) => `${m}\n${newLine}`);
+        } else {
+            updated += `\n\n## 🧠 COMBO CHECKLIST — ${category}\n${newLine}\n`;
+        }
+
+        await this.plugin.writeTemplate(updated);
+        this.combos = parseCombosFromMarkdown(updated);
+        return true;
+    }
+
+    // Shared delete/update for combo lines — both act on combo.rawText (the
+    // exact original markdown line captured by the parser) so they can find
+    // and replace/remove precisely the right line without disturbing anything
+    // else in the note, then reparse this.combos from the saved result.
+    async deleteComboText(rawText) {
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+        const idx = fileContent.indexOf(rawText);
+        if (idx === -1) { new Notice('Could not find that combo line in the note — it may have changed.'); return false; }
+        let end = idx + rawText.length;
+        if (fileContent[end] === '\r' && fileContent[end + 1] === '\n') end += 2;
+        else if (fileContent[end] === '\n') end += 1;
+        const updated = fileContent.slice(0, idx) + fileContent.slice(end);
+        await this.plugin.writeTemplate(updated);
+        this.combos = parseCombosFromMarkdown(updated);
+        return true;
+    }
+
+    async updateComboText(oldRawText, newText, learned) {
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+        if (!fileContent.includes(oldRawText)) { new Notice('Could not find that combo line in the note — it may have changed.'); return false; }
+        const newLine = `- [${learned ? 'x' : ' '}] ${newText}`;
+        const updated = fileContent.replace(oldRawText, newLine);
+        await this.plugin.writeTemplate(updated);
+        this.combos = parseCombosFromMarkdown(updated);
+        return true;
+    }
+
+    // ── Siding Patterns (Side Deck tab) ─────────────────────────────────────
+    // Saves a new "## vs X / OUT: ... / IN: ..." block right after the top
+    // "SIDING PATTERNS" heading, creating that heading (and the section) at
+    // the end of the note if it doesn't exist yet — same insertion strategy
+    // as saveComboText.
+    async saveSidingPattern(matchup, outText, inText) {
+        const fileContent = await this.plugin.readTemplate();
+        if (!fileContent) { new Notice('No active file to save to.'); return false; }
+
+        const block = `## vs ${matchup}\nOUT: ${outText}\nIN: ${inText}`;
+        const topHeadingRe = /^(#{1,6}[^\n]*siding[^\n]*patterns?[^\n]*)/im;
+
+        let updated;
+        if (topHeadingRe.test(fileContent)) {
+            updated = fileContent.replace(topHeadingRe, (m) => `${m}\n\n${block}\n`);
+        } else {
+            const trimmed = fileContent.replace(/\s+$/, '');
+            updated = `${trimmed}\n\n# 🔄 SIDING PATTERNS\n\n${block}\n`;
+        }
+
+        await this.plugin.writeTemplate(updated);
+        this.sidingPatterns = parseSidingPatternsFromMarkdown(updated);
+        return true;
+    }
+
+    // Edit = delete the old block, then save the new one — simpler and just
+    // as reliable as trying to rewrite three lines in place, since the block
+    // can move around in the file structure between edits anyway.
+    async updateSidingPattern(oldPattern, matchup, outText, inText) {
+        const deleted = await this.deleteSidingPattern(oldPattern);
+        if (!deleted) return false;
+        return this.saveSidingPattern(matchup, outText, inText);
+    }
+
+    async deleteSidingPattern(pattern) {
+        let content = await this.plugin.readTemplate();
+        if (!content) { new Notice('No active file to save to.'); return false; }
+
+        const removeLine = (text, rawLine) => {
+            if (!rawLine) return text;
+            const idx = text.indexOf(rawLine);
+            if (idx === -1) return text;
+            let end = idx + rawLine.length;
+            if (text[end] === '\r' && text[end + 1] === '\n') end += 2;
+            else if (text[end] === '\n') end += 1;
+            return text.slice(0, idx) + text.slice(end);
+        };
+
+        content = removeLine(content, pattern.inLine);
+        content = removeLine(content, pattern.outLine);
+        content = removeLine(content, pattern.headingLine);
+
+        await this.plugin.writeTemplate(content);
+        this.sidingPatterns = parseSidingPatternsFromMarkdown(content);
+        this.appliedSidingPatterns.delete(pattern.matchup);
+        return true;
+    }
+
+    // Moves `qty` copies of named cards between deck zones — the shared move
+    // primitive behind both applying and reverting a siding pattern. Every
+    // card involved is already fully loaded (Main/Extra cards for OUT,
+    // Side Deck cards for IN), so this mutates this.decks/this.allCards
+    // directly instead of a full network reload, and persists the same
+    // moves to the note via decrementCardInTemplate/upsertCardInTemplate.
+    // Validates availability for the WHOLE list before changing anything, so
+    // a pattern that can't fully apply doesn't partially apply.
+    async applySidingChange(outList, inList) {
+        const findInGroups = (name, groups) => this.allCards.find(
+            c => groups.includes(c.deckGroup) && c.name.toLowerCase() === name.toLowerCase()
+        );
+
+        for (const { name, count } of outList) {
+            const entry = findInGroups(name, ['main60', 'extra']);
+            if (!entry || (entry.count || 1) < count) {
+                new Notice(`Can't move ${count}× "${name}" out — not enough copies in Main/Extra.`);
+                return false;
+            }
+        }
+        for (const { name, count } of inList) {
+            const entry = findInGroups(name, ['side']);
+            if (!entry || (entry.count || 1) < count) {
+                new Notice(`Can't move ${count}× "${name}" in — not enough copies in the Side Deck.`);
+                return false;
+            }
+        }
+
+        let content = await this.plugin.readTemplate();
+        if (!content) { new Notice('No active file to save to.'); return false; }
+
+        const moveCard = (name, qty, fromGroup, toGroup) => {
+            const fromArr = this.decks[fromGroup];
+            const idx = fromArr.findIndex(c => c.name.toLowerCase() === name.toLowerCase());
+            const card = fromArr[idx];
+            const newFromCount = (card.count || 1) - qty;
+
+            for (let i = 0; i < qty; i++) {
+                content = decrementCardInTemplate(content, name, fromGroup).content;
+            }
+            if (newFromCount <= 0) {
+                fromArr.splice(idx, 1);
+                this.allCards = this.allCards.filter(c => c !== card);
+            } else {
+                card.count = newFromCount;
+            }
+
+            const toArr = this.decks[toGroup];
+            const existing = toArr.find(c => c.name.toLowerCase() === name.toLowerCase());
+            if (existing) {
+                existing.count = (existing.count || 1) + qty;
+                content = upsertCardInTemplate(content, existing);
+            } else {
+                const copy = { ...card, count: qty, deckGroup: toGroup, owned: true };
+                toArr.push(copy);
+                this.allCards.push(copy);
+                content = upsertCardInTemplate(content, copy);
+            }
+        };
+
+        for (const { name, count } of outList) {
+            const entry = findInGroups(name, ['main60', 'extra']);
+            moveCard(name, count, entry.deckGroup, 'side');
+        }
+        for (const { name, count } of inList) {
+            const entry = findInGroups(name, ['side']);
+            const isExtraType = entry.type && /Fusion|Synchro|Xyz|Link/.test(entry.type);
+            moveCard(name, count, 'side', isExtraType ? 'extra' : 'main60');
+        }
+
+        await this.plugin.writeTemplate(content);
+        return true;
+    }
+
+    // Toggles a siding pattern between applied and reverted. Applying moves
+    // OUT cards Main/Extra→Side and IN cards Side→Main/Extra; reverting does
+    // the exact same move with the lists swapped.
+    async applySidingPattern(pattern) {
+        const isApplied = this.appliedSidingPatterns.has(pattern.matchup);
+        const ok = isApplied
+            ? await this.applySidingChange(pattern.in, pattern.out)
+            : await this.applySidingChange(pattern.out, pattern.in);
+        if (!ok) return false;
+
+        if (isApplied) this.appliedSidingPatterns.delete(pattern.matchup);
+        else this.appliedSidingPatterns.add(pattern.matchup);
+        return true;
+    }
+
+    // ── Side Deck tab: Siding Patterns ──────────────────────────────────────
+    renderSidingPatterns(container) {
+        const patterns = this.sidingPatterns || [];
+        const serializeList = (list) => list.map(({ name, count }) => count > 1 ? `${name} ×${count}` : name).join(', ');
+        const resolveArt = (name) => this.allCards.find(c => c.name.toLowerCase() === name.toLowerCase());
+
+        // ── Controls + Add/Edit form ─────────────────────────────────────────
+        const controls = container.createEl('div');
+        controls.style.cssText = 'display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center;';
+
+        const sideCopies = (this.decks.side || []).reduce((n, c) => n + (c.count || 1), 0);
+        const info = controls.createEl('span');
+        info.style.cssText = 'font-size: 0.75em; color: #6b7280; font-family: monospace; margin-right: auto;';
+        info.textContent = `${patterns.length} siding pattern${patterns.length === 1 ? '' : 's'} · Side Deck: ${sideCopies}/15`;
+
+        const addBtn = this.makeBtn(controls, '+ Add Pattern', '#7c3aed', '#fff');
+
+        const addForm = container.createEl('div');
+        addForm.style.cssText = `
+            display: none; flex-direction: column; gap: 6px; margin-bottom: 16px;
+            padding: 10px; background: #111827; border-radius: 8px; border: 1px solid #1f2937;
+        `;
+        const fieldStyle = `
+            background: #1f2937; border: 1px solid #374151; border-radius: 6px;
+            padding: 7px 10px; color: #e2e8f0; font-size: 0.82em; outline: none; font-family: monospace;
+        `;
+        const matchupInput = addForm.createEl('input');
+        matchupInput.placeholder = 'Matchup name (e.g. Kashtira)…';
+        matchupInput.style.cssText = fieldStyle;
+        const outInput = addForm.createEl('input');
+        outInput.placeholder = 'OUT — comma-separated, e.g. Ash Blossom & Joyous Spring ×2, Called by the Grave';
+        outInput.style.cssText = fieldStyle;
+        const inInput = addForm.createEl('input');
+        inInput.placeholder = 'IN — comma-separated, e.g. Crossout Designator ×2';
+        inInput.style.cssText = fieldStyle;
+        const formBtnRow = addForm.createEl('div');
+        formBtnRow.style.cssText = 'display: flex; gap: 8px;';
+        const saveBtn = this.makeBtn(formBtnRow, '💾 Save Pattern', '#7c3aed', '#fff');
+        const cancelBtn = this.makeBtn(formBtnRow, 'Cancel', '#374151', '#e2e8f0');
+
+        let editingPattern = null;
+        const resetForm = () => {
+            editingPattern = null;
+            matchupInput.value = ''; outInput.value = ''; inInput.value = '';
+            saveBtn.textContent = '💾 Save Pattern';
+            addForm.style.display = 'none';
+        };
+
+        addBtn.onclick = () => {
+            if (addForm.style.display === 'none') { editingPattern = null; addForm.style.display = 'flex'; }
+            else resetForm();
+        };
+        cancelBtn.onclick = () => resetForm();
+        saveBtn.onclick = async () => {
+            const matchup = matchupInput.value.trim();
+            if (!matchup) return new Notice('Enter a matchup name.');
+            const ok = editingPattern
+                ? await this.updateSidingPattern(editingPattern, matchup, outInput.value.trim(), inInput.value.trim())
+                : await this.saveSidingPattern(matchup, outInput.value.trim(), inInput.value.trim());
+            if (!ok) return;
+            const wasEditing = !!editingPattern;
+            resetForm();
+            this.switchTab('siding');
+            this.setStatus(`✅ Siding pattern ${wasEditing ? 'updated' : 'added'}: "vs ${matchup}"`);
+        };
+
+        // ── Pattern list ─────────────────────────────────────────────────────
+        if (patterns.length === 0) {
+            const empty = container.createEl('div');
+            empty.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.85em; padding: 30px 0; text-align: center;';
+            empty.textContent = 'No siding patterns yet — add one for a matchup you play often.';
+            return;
+        }
+
+        const renderChipList = (wrap, list, color) => {
+            for (const { name, count } of list) {
+                const card = resolveArt(name);
+                const chip = wrap.createEl('div');
+                chip.style.cssText = `
+                    display: inline-flex; align-items: center; gap: 4px;
+                    background: ${color}18; border: 1px solid ${color}55; border-radius: 5px;
+                    padding: 2px 7px 2px 2px; font-size: 0.75em; color: ${color}; font-family: monospace;
+                `;
+                if (card?.image) {
+                    const img = chip.createEl('img');
+                    img.src = card.image;
+                    img.style.cssText = 'width: 18px; height: 26px; object-fit: cover; border-radius: 2px;';
+                }
+                chip.appendChild(document.createTextNode(`${name}${count > 1 ? ` ×${count}` : ''}`));
+            }
+        };
+
+        for (const pattern of patterns) {
+            const applied = this.appliedSidingPatterns.has(pattern.matchup);
+            const row = container.createEl('div');
+            row.style.cssText = `
+                background: #111827; border: 1.5px solid ${applied ? '#4ade80' : '#1f2937'};
+                border-radius: 8px; padding: 12px 14px; margin-bottom: 12px;
+            `;
+
+            const headerRow = row.createEl('div');
+            headerRow.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 8px;';
+
+            const title = headerRow.createEl('div');
+            title.textContent = `vs ${pattern.matchup}${applied ? '  🟢 Sided In' : ''}`;
+            title.style.cssText = `font-family: monospace; font-weight: bold; font-size: 0.9em; color: ${applied ? '#4ade80' : '#e2e8f0'};`;
+
+            const actionsCol = headerRow.createEl('div');
+            actionsCol.style.cssText = 'display: flex; gap: 4px; align-items: center; flex-shrink: 0;';
+
+            const applyBtn = actionsCol.createEl('button');
+            applyBtn.textContent = applied ? '🔙 Revert' : '🔃 Apply Siding';
+            applyBtn.style.cssText = `
+                background: ${applied ? '#374151' : '#7c3aed'}; color: #fff; border: none;
+                padding: 5px 11px; border-radius: 6px; cursor: pointer;
+                font-size: 0.76em; font-family: monospace; font-weight: bold;
+            `;
+            applyBtn.onclick = async () => {
+                applyBtn.disabled = true;
+                const ok = await this.applySidingPattern(pattern);
+                applyBtn.disabled = false;
+                if (!ok) return;
+                this.switchTab('siding');
+                this.setStatus(applied ? `🔙 Reverted siding vs ${pattern.matchup}` : `🔃 Applied siding vs ${pattern.matchup}`);
+            };
+
+            const mkIconBtn = (icon) => {
+                const b = actionsCol.createEl('button');
+                b.textContent = icon;
+                b.style.cssText = `
+                    background: none; border: none; cursor: pointer; font-size: 0.85em;
+                    padding: 3px 6px; border-radius: 4px; opacity: 0.6; transition: opacity .12s;
+                `;
+                b.onmouseenter = () => b.style.opacity = '1';
+                b.onmouseleave = () => { if (!b.dataset.confirming) b.style.opacity = '0.6'; };
+                return b;
+            };
+
+            const editBtn = mkIconBtn('✏️');
+            editBtn.title = 'Edit pattern';
+            editBtn.onclick = () => {
+                editingPattern = pattern;
+                matchupInput.value = pattern.matchup;
+                outInput.value = serializeList(pattern.out);
+                inInput.value = serializeList(pattern.in);
+                saveBtn.textContent = '💾 Save Changes';
+                addForm.style.display = 'flex';
+                addForm.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            };
+
+            const deleteBtn = mkIconBtn('🗑️');
+            deleteBtn.title = 'Delete pattern';
+            deleteBtn.onclick = async () => {
+                if (!deleteBtn.dataset.confirming) {
+                    deleteBtn.dataset.confirming = '1';
+                    deleteBtn.textContent = '❗ confirm';
+                    deleteBtn.style.opacity = '1';
+                    deleteBtn.style.color = '#f87171';
+                    setTimeout(() => {
+                        if (deleteBtn.dataset.confirming) {
+                            delete deleteBtn.dataset.confirming;
+                            deleteBtn.textContent = '🗑️';
+                            deleteBtn.style.opacity = '0.6';
+                            deleteBtn.style.color = '';
+                        }
+                    }, 2500);
+                    return;
+                }
+                const ok = await this.deleteSidingPattern(pattern);
+                if (!ok) return;
+                this.switchTab('siding');
+                this.setStatus(`🗑️ Siding pattern deleted: "vs ${pattern.matchup}"`);
+            };
+
+            const listsWrap = row.createEl('div');
+            listsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
+
+            const outRow = listsWrap.createEl('div');
+            outRow.style.cssText = 'display: flex; flex-wrap: wrap; align-items: center; gap: 5px;';
+            const outLabel = outRow.createEl('span', { text: 'OUT' });
+            outLabel.style.cssText = 'font-size: 0.68em; color: #6b7280; font-family: monospace; font-weight: bold; width: 30px;';
+            renderChipList(outRow, pattern.out, '#f87171');
+
+            const inRow = listsWrap.createEl('div');
+            inRow.style.cssText = 'display: flex; flex-wrap: wrap; align-items: center; gap: 5px;';
+            const inLabel = inRow.createEl('span', { text: 'IN' });
+            inLabel.style.cssText = 'font-size: 0.68em; color: #6b7280; font-family: monospace; font-weight: bold; width: 30px;';
+            renderChipList(inRow, pattern.in, '#4ade80');
         }
     }
 
@@ -2056,38 +2665,32 @@ class DeckUI extends Modal {
         saveComboBtn.onclick = async () => {
             const text = newComboInput.value.trim();
             if (!text) return new Notice('Enter a combo description.');
-            const cat = (catInput.value.trim() || categories[0] || 'General');
-            const newLine = `- [ ] ${text}`;
+            const cat = catInput.value.trim();
+            const ok = await this.saveComboText(text, cat, categories);
+            if (!ok) return;
 
-            const fileContent = await this.plugin.readTemplate();
-            if (!fileContent) return new Notice('No active file to save to.');
-
-            // Try to append under a matching heading, or the COMBO section, or end of file
-            let updated = fileContent;
-            const catHeadingRe = new RegExp(`(^#{1,6}[^\\n]*${cat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*)`, 'im');
-            const comboHeadingRe = /^(#{1,6}[^\n]*\bcombo\b[^\n]*)/im;
-
-            if (catHeadingRe.test(updated)) {
-                // Insert after the matching category heading's last item
-                updated = updated.replace(catHeadingRe, (m) => `${m}\n${newLine}`);
-            } else if (comboHeadingRe.test(updated)) {
-                // Insert at end of the first COMBO section
-                updated = updated.replace(comboHeadingRe, (m) => `${m}\n${newLine}`);
-            } else {
-                // Append a new combo section at end
-                updated += `\n\n## 🧠 COMBO CHECKLIST — ${cat}\n${newLine}\n`;
-            }
-
-            await this.plugin.writeTemplate(updated);
-            this.combos = parseCombosFromMarkdown(updated);
             newComboInput.value = '';
             addForm.style.display = 'none';
-            container.empty();
-            this.renderCombos(container);
             this.switchTab('combos');
             this.setStatus(`✅ Combo added: "${text.slice(0, 50)}"`);
         };
         newComboInput.addEventListener('keydown', e => { if (e.key === 'Enter') saveComboBtn.click(); });
+
+        // Visual Combo Builder — step-by-step picker with autocomplete against
+        // known cards (this.allCards + comboCardCache) and a live preview,
+        // instead of hand-typing the arrow-joined text. Saves through the same
+        // saveComboText() path as the quick-add form above.
+        const builderBtn = controls.createEl('button');
+        builderBtn.textContent = '🧩 Visual Builder';
+        builderBtn.style.cssText = `
+            background: #1e1b4b; color: #a78bfa; border: 1px solid #4c1d95;
+            padding: 5px 13px; border-radius: 6px; cursor: pointer;
+            font-size: 0.78em; font-family: monospace; font-weight: bold;
+            transition: opacity .12s;
+        `;
+        builderBtn.onmouseenter = () => builderBtn.style.opacity = '0.75';
+        builderBtn.onmouseleave = () => builderBtn.style.opacity = '1';
+        builderBtn.onclick = () => new ComboBuilderUI(this.app, this.plugin, this, categories).open();
 
         // ── List area ────────────────────────────────────────────────────────
         const listArea = container.createEl('div');
@@ -2377,6 +2980,56 @@ class DeckUI extends Modal {
                     row.appendChild(check);
                     row.appendChild(contentCol);
 
+                    // Edit / Delete — stopPropagation so they don't also
+                    // trigger the row's learned-toggle click handler below.
+                    const actionsCol = row.createEl('div');
+                    actionsCol.style.cssText = 'display: flex; gap: 2px; flex-shrink: 0; padding-top: 1px;';
+
+                    const mkActionBtn = (icon) => {
+                        const b = actionsCol.createEl('button');
+                        b.textContent = icon;
+                        b.style.cssText = `
+                            background: none; border: none; cursor: pointer; font-size: 0.85em;
+                            padding: 3px 6px; border-radius: 4px; opacity: 0.55; transition: opacity .12s, background .12s;
+                        `;
+                        b.onmouseenter = () => { b.style.opacity = '1'; b.style.background = '#1f2937'; };
+                        b.onmouseleave = () => { if (!b.dataset.confirming) { b.style.opacity = '0.55'; b.style.background = 'none'; } };
+                        return b;
+                    };
+
+                    const editBtn = mkActionBtn('✏️');
+                    editBtn.title = 'Edit combo';
+                    editBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        new ComboBuilderUI(this.app, this.plugin, this, categories, combo).open();
+                    };
+
+                    const deleteBtn = mkActionBtn('🗑️');
+                    deleteBtn.title = 'Delete combo';
+                    deleteBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        if (!deleteBtn.dataset.confirming) {
+                            deleteBtn.dataset.confirming = '1';
+                            deleteBtn.textContent = '❗ confirm';
+                            deleteBtn.style.opacity = '1';
+                            deleteBtn.style.color = '#f87171';
+                            setTimeout(() => {
+                                if (deleteBtn.dataset.confirming) {
+                                    delete deleteBtn.dataset.confirming;
+                                    deleteBtn.textContent = '🗑️';
+                                    deleteBtn.style.opacity = '0.55';
+                                    deleteBtn.style.color = '';
+                                }
+                            }, 2500);
+                            return;
+                        }
+                        const ok = await this.deleteComboText(combo.rawText);
+                        if (!ok) return;
+                        this.switchTab('combos');
+                        this.setStatus(`🗑️ Combo deleted: "${combo.text.slice(0, 40)}"`);
+                    };
+                    row.appendChild(actionsCol);
+
                     // Click to toggle learned
                     row.onclick = async () => {
                         combo.learned = !combo.learned;
@@ -2434,8 +3087,10 @@ class DeckUI extends Modal {
             return new Notice(msg);
         }
 
-        // Always reload combos from the latest file content
+        // Always reload combos and siding patterns from the latest file content
         this.combos = parseCombosFromMarkdown(content);
+        this.sidingPatterns = parseSidingPatternsFromMarkdown(content);
+        this.appliedSidingPatterns = new Set();
 
         const entries = parseCardsFromMarkdown(content);
         if (entries.length === 0) {
@@ -2444,7 +3099,7 @@ class DeckUI extends Modal {
             return;
         }
 
-        this.decks = { main60: [], main40: [], extra: [] };
+        this.decks = { main60: [], main40: [], extra: [], side: [] };
         this.allCards = [];
         this.setStatus(`Fetching ${entries.length} unique cards from template…`);
 
@@ -2648,26 +3303,25 @@ class DeckUI extends Modal {
         this.switchTab(this.activeTab);
     }
 
-    // Checks main/extra deck sizes and per-card Master Duel copy limits.
-    // Uses the 40-card variant as "the main deck" when it has cards (since
-    // that's a deliberate, exact-40 build), otherwise the 40–60 main deck.
-    // Copy limits are checked against main+extra combined (Side Deck isn't
-    // tracked by this plugin, so it's excluded).
+    // Checks main/extra/side deck sizes and per-card Master Duel copy limits.
+    // Acts on whichever of Main Deck (60) / 40-Card Variant was last viewed
+    // (this.lastMainDeckTab) — Validate/Craft List are toolbar buttons
+    // visible from every tab, so checking this.activeTab directly meant
+    // clicking them from Extra/Combos/Test Hand/etc always silently fell
+    // back to Main 60, even right after viewing the 40-Card Variant tab.
+    // Copy limits are checked against main+extra+side combined, since a real
+    // Master Duel/TCG copy limit spans all three zones together.
     validateDeck() {
-        // Validate whichever main-deck tab the user is currently viewing.
-        // If they're on a non-deck tab (Extra/Combos/Test Hand), default to
-        // the primary 60-card Main Deck — not the 40-card variant — since
-        // that's the deck being built unless the user is actively looking
-        // at the variant tab.
-        const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
-        const mainKey = onDeckTab ? this.activeTab : 'main60';
+        const mainKey = this.lastMainDeckTab;
         const mainCards = this.decks[mainKey];
         const extraCards = this.decks.extra;
+        const sideCards = this.decks.side || [];
 
         const sumCopies = cards => cards.reduce((n, c) => n + (c.count || 1), 0);
         const mainCount = sumCopies(mainCards);
         const extraCount = sumCopies(extraCards);
-        const mainMin = 40, mainMax = mainKey === 'main40' ? 40 : 60, extraMax = 15;
+        const sideCount = sumCopies(sideCards);
+        const mainMin = 40, mainMax = mainKey === 'main40' ? 40 : 60, extraMax = 15, sideMax = 15;
 
         const errors = [], warnings = [];
         if (mainCount < mainMin || mainCount > mainMax) {
@@ -2676,9 +3330,12 @@ class DeckUI extends Modal {
         if (extraCount > extraMax) {
             errors.push(`Extra Deck has ${extraCount} cards (max ${extraMax})`);
         }
+        if (sideCount > sideMax) {
+            errors.push(`Side Deck has ${sideCount} cards (max ${sideMax})`);
+        }
 
-        const combined = new Map(); // name -> { total copies across main+extra, konami_id }
-        for (const c of [...mainCards, ...extraCards]) {
+        const combined = new Map(); // name -> { total copies across main+extra+side, konami_id }
+        for (const c of [...mainCards, ...extraCards, ...sideCards]) {
             const prev = combined.get(c.name);
             combined.set(c.name, { total: (prev?.total || 0) + (c.count || 1), konami_id: c.konami_id });
         }
@@ -2687,14 +3344,14 @@ class DeckUI extends Modal {
             const limit = BANLIST_COPY_LIMIT[status] ?? 3;
             if (total > limit) {
                 errors.push(limit === 0
-                    ? `"${name}" is Forbidden in Master Duel (×${total} in deck)`
-                    : `"${name}" exceeds its Master Duel limit — ${status}: ${total}/${limit}`);
+                    ? `"${name}" is Forbidden in Master Duel (×${total} across Main/Extra/Side)`
+                    : `"${name}" exceeds its Master Duel limit — ${status}: ${total}/${limit} across Main/Extra/Side`);
             } else if (status !== 'Unlimited') {
                 warnings.push(`"${name}" is ${status} in Master Duel (${total}/${limit})`);
             }
         }
 
-        return { mainKey, mainCount, mainMin, mainMax, extraCount, extraMax, errors, warnings };
+        return { mainKey, mainCount, mainMin, mainMax, extraCount, extraMax, sideCount, sideMax, errors, warnings };
     }
 
     showValidation() {
@@ -2706,6 +3363,7 @@ class DeckUI extends Modal {
             '─────────────────',
             `${r.mainKey === 'main40' ? 'Main Deck (40)' : 'Main Deck'}   ${r.mainCount} / ${r.mainMax}`,
             `Extra Deck      ${r.extraCount} / ${r.extraMax}`,
+            `Side Deck       ${r.sideCount} / ${r.sideMax}`,
         ];
         if (r.errors.length) {
             lines.push('', 'Errors:');
@@ -2731,39 +3389,54 @@ class DeckUI extends Modal {
             return new Notice(`⚠️ No collection data loaded. Set up "${this.plugin.settings.collectionNotePath}" (Settings → 📦 Create Collection Note) first.`);
         }
 
-        const onDeckTab = this.activeTab === 'main60' || this.activeTab === 'main40';
-        const mainKey = onDeckTab ? this.activeTab : 'main60';
-        const cards = [...this.decks[mainKey], ...this.decks.extra];
-
-        const needed = new Map(); // name -> { need, rarity }
-        for (const c of cards) {
-            const prev = needed.get(c.name);
-            needed.set(c.name, { need: (prev?.need || 0) + (c.count || 1), rarity: c.rarity });
-        }
-
-        const missing = [];
-        const byRarity = { UR: 0, SR: 0, R: 0, N: 0 };
-        for (const [name, { need, rarity }] of needed) {
-            const have = this.collectionMap.get(name.toLowerCase())?.count || 0;
-            const short = need - have;
-            if (short > 0) {
-                missing.push(`${name} [${rarity}]  need ${short} more`);
-                byRarity[rarity in byRarity ? rarity : 'N'] += short;
+        // Two separate shopping lists, not one combined pool — Main Deck (60)
+        // and the 40-Card Variant are alternate builds, each paired with the
+        // shared Extra Deck rather than summed together (that previously made
+        // "need" look inflated when a card only belonged to one build). Side
+        // Deck stays excluded from both: its cards are meant to be the same
+        // physical copies as Main/Extra, moved via Apply Siding, not extra
+        // copies to own on top.
+        const buildReport = (cards) => {
+            const needed = new Map(); // name -> { need, rarity }
+            for (const c of cards) {
+                const prev = needed.get(c.name);
+                needed.set(c.name, { need: (prev?.need || 0) + (c.count || 1), rarity: c.rarity });
             }
-        }
+            const missing = [];
+            const byRarity = { UR: 0, SR: 0, R: 0, N: 0 };
+            for (const [name, { need, rarity }] of needed) {
+                const have = this.collectionMap.get(name.toLowerCase())?.count || 0;
+                const short = need - have;
+                if (short > 0) {
+                    missing.push(`${name} [${rarity}]  need ${short} more`);
+                    byRarity[rarity in byRarity ? rarity : 'N'] += short;
+                }
+            }
+            return { missing, byRarity };
+        };
 
-        if (missing.length === 0) {
-            return new Notice('✅ You already own every card in this deck!');
-        }
+        const mainReport = buildReport([...this.decks.main60, ...this.decks.extra]);
+        const variantReport = buildReport([...this.decks.main40, ...this.decks.extra]);
 
-        const lines = [
-            `📦 MISSING FROM COLLECTION (${missing.length} cards)`,
-            '─────────────────',
-            ...missing,
-            '',
-            `Crafting: ◆ UR ${byRarity.UR}  ◇ SR ${byRarity.SR}  ● R ${byRarity.R}  ○ N ${byRarity.N}`
-        ];
-        new Notice(lines.join('\n'), 20000);
+        const sections = [];
+        const addSection = (title, report) => {
+            if (report.missing.length === 0) {
+                sections.push(`${title}\n✅ You already own every card here!`);
+            } else {
+                sections.push([
+                    `${title} — MISSING (${report.missing.length} cards)`,
+                    '─────────────────',
+                    ...report.missing,
+                    '',
+                    `Crafting: ◆ UR ${report.byRarity.UR}  ◇ SR ${report.byRarity.SR}  ● R ${report.byRarity.R}  ○ N ${report.byRarity.N}`,
+                ].join('\n'));
+            }
+        };
+
+        addSection('📦 MAIN DECK (60) + EXTRA', mainReport);
+        addSection('📦 40-CARD VARIANT + EXTRA', variantReport);
+
+        new Notice(sections.join('\n\n'), 20000);
     }
 
     showStats() {
@@ -2799,7 +3472,7 @@ class DeckUI extends Modal {
     // counts. Extra Deck is excluded (see classifyCardRole).
     renderAnalysis(container) {
         if (!this.analysisDeck) {
-            this.analysisDeck = this.decks.main40.length > 0 ? 'main40' : 'main60';
+            this.analysisDeck = this.lastMainDeckTab; // same "last viewed" default as Test Hand/Validate/Craft List, not "the variant, if it happens to be non-empty"
         }
 
         const controls = container.createEl('div');
@@ -3054,8 +3727,11 @@ class DeckUI extends Modal {
             const success = await this.plugin.writeTemplate(DECK_TEMPLATE);
             if (success) {
                 // Reset UI state — the note is now a blank template
-                this.decks = { main60: [], main40: [], extra: [] };
+                this.decks = { main60: [], main40: [], extra: [], side: [] };
                 this.allCards = [];
+                this.combos = [];
+                this.sidingPatterns = [];
+                this.appliedSidingPatterns = new Set();
                 this.switchTab(this.activeTab);
                 this.setStatus(`✅ Template applied to "${file.name}". Fill in your deck and hit 🔄 Reload.`);
                 new Notice(`✅ Blank template applied to "${file.name}"`);
@@ -3685,6 +4361,284 @@ class CardSearchUI extends Modal {
                 setTimeout(() => { wrap.style.borderColor = rarityColor + '77'; }, 400);
             }
         };
+    }
+}
+
+// Visual Combo Builder — lets you assemble a combo as a sequence of card
+// steps (autocompleted against cards already known to the plugin: deck cards
+// + previously-resolved combo cards) instead of hand-typing the arrow-joined
+// text. Still saves through DeckUI.saveComboText(), so it produces the exact
+// same "- [ ] A → B → C" markdown line the text parser already understands —
+// this is a friendlier input method, not a new storage format.
+class ComboBuilderUI extends Modal {
+    constructor(app, plugin, deckUI, categories, existingCombo = null) {
+        super(app);
+        this.plugin = plugin;
+        this.deckUI = deckUI;
+        this.categories = categories || [];
+        this.existingCombo = existingCombo;
+        this.stepRows = []; // { rowEl, input, dropdown }
+    }
+
+    getCandidatePool() {
+        const map = new Map();
+        for (const c of this.deckUI.allCards || []) {
+            if (!map.has(c.name.toLowerCase())) map.set(c.name.toLowerCase(), c);
+        }
+        for (const c of (this.deckUI.comboCardCache || new Map()).values()) {
+            if (!map.has(c.name.toLowerCase())) map.set(c.name.toLowerCase(), c);
+        }
+        return [...map.values()];
+    }
+
+    onOpen() {
+        this.pool = this.getCandidatePool();
+        this.modalEl.style.width = '640px';
+        this.modalEl.style.maxWidth = '95vw';
+
+        const { contentEl } = this;
+        contentEl.style.cssText = `
+            background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif; padding: 0;
+        `;
+
+        const header = contentEl.createEl('div');
+        header.style.cssText = `
+            background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%);
+            padding: 16px 24px 12px; border-bottom: 2px solid #a78bfa44;
+        `;
+        const title = header.createEl('h1');
+        title.textContent = this.existingCombo ? '✏️ Edit Combo' : '🧩 Visual Combo Builder';
+        title.style.cssText = `
+            margin: 0 0 3px; font-size: 1.25em; font-weight: bold;
+            background: linear-gradient(90deg, #a78bfa, #c4b5fd);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        `;
+        const sub = header.createEl('p');
+        sub.textContent = this.existingCombo
+            ? 'Editing steps only — category stays where this combo already lives in the note.'
+            : 'Pick each step from your known cards — art resolves automatically. Unrecognized text still works as a shorthand step.';
+        sub.style.cssText = 'margin: 0; font-size: 0.7em; color: #94a3b8; font-family: monospace;';
+
+        const body = contentEl.createEl('div');
+        body.style.cssText = 'padding: 16px 24px 20px; max-height: 68vh; overflow-y: auto;';
+
+        // ── Category (hidden when editing — see sub text above) ────────────────
+        const catRow = body.createEl('div');
+        catRow.style.cssText = `display: ${this.existingCombo ? 'none' : 'flex'}; gap: 8px; margin-bottom: 14px;`;
+        const catFieldStyle = `
+            background: #1f2937; border: 1px solid #4c1d95; border-radius: 6px;
+            padding: 7px 10px; color: #e2e8f0; font-size: 0.82em; outline: none; font-family: monospace;
+        `;
+        const catSelect = catRow.createEl('select');
+        catSelect.style.cssText = catFieldStyle + 'flex: 1;';
+        (this.categories.length ? this.categories : ['General']).forEach(cat => {
+            const opt = catSelect.createEl('option');
+            opt.value = cat; opt.textContent = cat;
+        });
+        const catCustom = catRow.createEl('input');
+        catCustom.placeholder = 'Or new category…';
+        catCustom.style.cssText = catFieldStyle + 'flex: 1;';
+
+        // ── Steps ────────────────────────────────────────────────────────────
+        const stepsHeading = body.createEl('div');
+        stepsHeading.textContent = 'Steps';
+        stepsHeading.style.cssText = 'font-family: monospace; font-size: 0.76em; color: #6b7280; margin-bottom: 6px;';
+
+        const stepsWrap = body.createEl('div');
+        stepsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px;';
+
+        const addStepBtn = body.createEl('button');
+        addStepBtn.textContent = '+ Add Step';
+        addStepBtn.style.cssText = `
+            background: #1f2937; color: #a78bfa; border: 1px dashed #4c1d95;
+            padding: 6px 12px; border-radius: 6px; cursor: pointer;
+            font-size: 0.78em; font-family: monospace; font-weight: bold; margin-bottom: 16px;
+        `;
+        addStepBtn.onclick = () => { this.addStepRow(stepsWrap); this.updatePreview(); };
+
+        // ── Live preview ─────────────────────────────────────────────────────
+        const previewHeading = body.createEl('div');
+        previewHeading.textContent = 'Preview';
+        previewHeading.style.cssText = 'font-family: monospace; font-size: 0.76em; color: #6b7280; margin-bottom: 6px;';
+        this.previewEl = body.createEl('div');
+        this.previewEl.style.cssText = `
+            display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-height: 44px;
+            background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 8px 10px;
+            margin-bottom: 18px;
+        `;
+
+        // ── Actions ──────────────────────────────────────────────────────────
+        const actions = body.createEl('div');
+        actions.style.cssText = 'display: flex; gap: 8px; justify-content: flex-end;';
+        const cancelBtn = actions.createEl('button', { text: 'Cancel' });
+        cancelBtn.style.cssText = `
+            background: #374151; color: #e2e8f0; border: none;
+            padding: 7px 15px; border-radius: 6px; cursor: pointer; font-size: 0.82em; font-family: monospace;
+        `;
+        cancelBtn.onclick = () => this.close();
+
+        const saveBtn = actions.createEl('button', { text: this.existingCombo ? '💾 Save Changes' : '💾 Save Combo' });
+        saveBtn.style.cssText = `
+            background: #7c3aed; color: #fff; border: none;
+            padding: 7px 15px; border-radius: 6px; cursor: pointer;
+            font-size: 0.82em; font-family: monospace; font-weight: bold;
+        `;
+        saveBtn.onclick = async () => {
+            const steps = this.stepRows.map(r => r.input.value.trim()).filter(Boolean);
+            if (steps.length < 2) {
+                return new Notice('Add at least 2 steps to form a combo.');
+            }
+            const text = steps.join(' → ');
+            let ok;
+            if (this.existingCombo) {
+                ok = await this.deckUI.updateComboText(this.existingCombo.rawText, text, this.existingCombo.learned);
+            } else {
+                const cat = catCustom.value.trim() || catSelect.value;
+                ok = await this.deckUI.saveComboText(text, cat, this.categories);
+            }
+            if (!ok) return;
+            this.deckUI.switchTab('combos');
+            this.deckUI.setStatus(`✅ Combo ${this.existingCombo ? 'updated' : 'added'}: "${text.slice(0, 50)}"`);
+            this.close();
+        };
+
+        // Prefill from the existing combo when editing; otherwise start with
+        // two empty steps — most combos need at least that many.
+        if (this.existingCombo) {
+            const existingSteps = this.existingCombo.text.split(/→|->|➜/).map(s => s.trim()).filter(Boolean);
+            if (existingSteps.length > 0) {
+                existingSteps.forEach(s => {
+                    this.addStepRow(stepsWrap);
+                    this.stepRows[this.stepRows.length - 1].input.value = s;
+                });
+            } else {
+                this.addStepRow(stepsWrap);
+                this.addStepRow(stepsWrap);
+            }
+        } else {
+            this.addStepRow(stepsWrap);
+            this.addStepRow(stepsWrap);
+        }
+        this.updatePreview();
+    }
+
+    addStepRow(stepsWrap) {
+        const idx = this.stepRows.length;
+        const row = stepsWrap.createEl('div');
+        row.style.cssText = 'display: flex; gap: 6px; align-items: center; position: relative;';
+
+        const numLabel = row.createEl('span');
+        numLabel.textContent = `${idx + 1}.`;
+        numLabel.style.cssText = 'font-family: monospace; font-size: 0.8em; color: #6b7280; width: 18px; flex-shrink: 0;';
+
+        const input = row.createEl('input');
+        input.placeholder = 'Card name or shorthand step…';
+        input.style.cssText = `
+            flex: 1; background: #1f2937; border: 1px solid #374151; border-radius: 6px;
+            padding: 7px 10px; color: #e2e8f0; font-size: 0.84em; font-family: monospace; outline: none;
+        `;
+        input.addEventListener('focus', () => input.style.borderColor = '#a78bfa');
+        input.addEventListener('blur', () => setTimeout(() => { dropdown.style.display = 'none'; input.style.borderColor = '#374151'; }, 150));
+
+        const removeBtn = row.createEl('button');
+        removeBtn.textContent = '✕';
+        removeBtn.style.cssText = `
+            background: none; border: none; color: #6b7280; cursor: pointer;
+            font-size: 0.9em; padding: 4px 6px; flex-shrink: 0;
+        `;
+        removeBtn.onclick = () => {
+            row.remove();
+            this.stepRows = this.stepRows.filter(r => r.row !== row);
+            this.renumberSteps(stepsWrap);
+            this.updatePreview();
+        };
+
+        const dropdown = row.createEl('div');
+        dropdown.style.cssText = `
+            display: none; position: absolute; top: 100%; left: 24px; right: 0; z-index: 10;
+            background: #1f2937; border: 1px solid #4c1d95; border-radius: 6px;
+            max-height: 160px; overflow-y: auto; margin-top: 2px;
+        `;
+
+        input.addEventListener('input', () => {
+            const q = input.value.trim().toLowerCase();
+            dropdown.empty();
+            if (!q) { dropdown.style.display = 'none'; this.updatePreview(); return; }
+            const matches = this.pool.filter(c => c.name.toLowerCase().includes(q)).slice(0, 8);
+            if (matches.length === 0) { dropdown.style.display = 'none'; this.updatePreview(); return; }
+            for (const card of matches) {
+                const item = dropdown.createEl('div');
+                item.style.cssText = `
+                    display: flex; align-items: center; gap: 6px; padding: 5px 8px; cursor: pointer;
+                    font-family: monospace; font-size: 0.78em; color: #e2e8f0;
+                `;
+                item.onmouseenter = () => item.style.background = '#374151';
+                item.onmouseleave = () => item.style.background = 'none';
+                if (card.image) {
+                    const img = item.createEl('img');
+                    img.src = card.image;
+                    img.style.cssText = 'width: 18px; height: 26px; object-fit: cover; border-radius: 2px; flex-shrink: 0;';
+                }
+                item.appendChild(document.createTextNode(card.name));
+                item.onmousedown = (e) => {
+                    e.preventDefault();
+                    input.value = card.name;
+                    dropdown.style.display = 'none';
+                    this.updatePreview();
+                };
+            }
+            dropdown.style.display = 'block';
+            this.updatePreview();
+        });
+
+        this.stepRows.push({ row, input, dropdown });
+    }
+
+    renumberSteps(stepsWrap) {
+        [...stepsWrap.children].forEach((row, i) => {
+            const label = row.querySelector('span');
+            if (label) label.textContent = `${i + 1}.`;
+        });
+    }
+
+    updatePreview() {
+        this.previewEl.empty();
+        const steps = this.stepRows.map(r => r.input.value.trim()).filter(Boolean);
+        if (steps.length === 0) {
+            const hint = this.previewEl.createEl('span');
+            hint.textContent = 'Fill in steps above to see a preview…';
+            hint.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.78em;';
+            return;
+        }
+        steps.forEach((step, i) => {
+            const match = this.pool.find(c => c.name.toLowerCase() === step.toLowerCase());
+            if (match) {
+                const chip = this.previewEl.createEl('span');
+                chip.style.cssText = `
+                    display: inline-flex; align-items: center; gap: 4px;
+                    background: #1e1b4b; border: 1px solid #4c1d95; border-radius: 4px;
+                    padding: 2px 6px 2px 2px; font-size: 0.8em; color: #c4b5fd; font-family: monospace;
+                `;
+                if (match.image) {
+                    const img = chip.createEl('img');
+                    img.src = match.image;
+                    img.style.cssText = 'width: 20px; height: 29px; object-fit: cover; border-radius: 2px;';
+                }
+                chip.appendChild(document.createTextNode(match.name));
+            } else {
+                const chip = this.previewEl.createEl('span');
+                chip.textContent = step;
+                chip.style.cssText = `
+                    font-size: 0.8em; color: #94a3b8; font-family: monospace;
+                    background: #1f2937; border: 1px dashed #374151; border-radius: 4px; padding: 2px 6px;
+                `;
+            }
+            if (i < steps.length - 1) {
+                const arrow = this.previewEl.createEl('span');
+                arrow.textContent = '→';
+                arrow.style.cssText = 'color: #a78bfa; font-weight: bold; font-size: 0.9em;';
+            }
+        });
     }
 }
 
