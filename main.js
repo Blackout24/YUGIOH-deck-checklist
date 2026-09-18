@@ -3414,6 +3414,10 @@ class DeckUI extends Modal {
             }
             return { missing, byRarity };
         };
+        // Same "last-viewed main deck tab" logic as validateDeck() — Craft
+        // List is also a toolbar button visible from every tab.
+        const mainKey = this.lastMainDeckTab;
+        const cards = [...this.decks[mainKey], ...this.decks.extra, ...(this.decks.side || [])];
 
         const mainReport = buildReport([...this.decks.main60, ...this.decks.extra]);
         const variantReport = buildReport([...this.decks.main40, ...this.decks.extra]);
