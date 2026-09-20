@@ -3408,39 +3408,24 @@ class DeckUI extends Modal {
                 const have = this.collectionMap.get(name.toLowerCase())?.count || 0;
                 const short = need - have;
                 if (short > 0) {
-                    missing.push(`${name} [${rarity}]  need ${short} more`);
+                    missing.push({ name, rarity, short });
                     byRarity[rarity in byRarity ? rarity : 'N'] += short;
                 }
             }
             return { missing, byRarity };
         };
-        // Same "last-viewed main deck tab" logic as validateDeck() — Craft
-        // List is also a toolbar button visible from every tab.
-        const mainKey = this.lastMainDeckTab;
-        const cards = [...this.decks[mainKey], ...this.decks.extra, ...(this.decks.side || [])];
 
         const mainReport = buildReport([...this.decks.main60, ...this.decks.extra]);
         const variantReport = buildReport([...this.decks.main40, ...this.decks.extra]);
 
-        const sections = [];
-        const addSection = (title, report) => {
-            if (report.missing.length === 0) {
-                sections.push(`${title}\n✅ You already own every card here!`);
-            } else {
-                sections.push([
-                    `${title} — MISSING (${report.missing.length} cards)`,
-                    '─────────────────',
-                    ...report.missing,
-                    '',
-                    `Crafting: ◆ UR ${report.byRarity.UR}  ◇ SR ${report.byRarity.SR}  ● R ${report.byRarity.R}  ○ N ${report.byRarity.N}`,
-                ].join('\n'));
-            }
-        };
-
-        addSection('📦 MAIN DECK (60) + EXTRA', mainReport);
-        addSection('📦 40-CARD VARIANT + EXTRA', variantReport);
-
-        new Notice(sections.join('\n\n'), 20000);
+        // A Notice toast doesn't scroll — it just silently clips anything past
+        // a fixed height, which is exactly why a second section never showed
+        // up at all once the list got long. Use a proper scrollable modal
+        // instead so every line is actually reachable.
+        new CraftListUI(this.app, [
+            { title: '📦 Main Deck (60) + Extra', report: mainReport },
+            { title: '📦 40-Card Variant + Extra', report: variantReport },
+        ]).open();
     }
 
     showStats() {
@@ -4643,6 +4628,83 @@ class ComboBuilderUI extends Modal {
                 arrow.style.cssText = 'color: #a78bfa; font-weight: bold; font-size: 0.9em;';
             }
         });
+    }
+}
+
+// Craft List — replaces the old Notice-based output, which silently clipped
+// anything past a fixed height (Notice doesn't scroll), hiding the second
+// section entirely once the combined list got long. Shows both build reports
+// (Main Deck (60)+Extra, 40-Card Variant+Extra) in a scrollable body so every
+// line is actually reachable.
+class CraftListUI extends Modal {
+    constructor(app, sections) {
+        super(app);
+        this.sections = sections; // [{ title, report: { missing: [{name,rarity,short}], byRarity } }]
+    }
+
+    onOpen() {
+        this.modalEl.style.width = '620px';
+        this.modalEl.style.maxWidth = '95vw';
+        this.modalEl.style.maxHeight = '85vh';
+
+        const { contentEl } = this;
+        contentEl.style.cssText = `
+            background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif;
+            padding: 0; display: flex; flex-direction: column; max-height: 82vh;
+        `;
+
+        const header = contentEl.createEl('div');
+        header.style.cssText = `
+            background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%);
+            padding: 16px 24px 12px; border-bottom: 2px solid #f472b644; flex-shrink: 0;
+        `;
+        const title = header.createEl('h1');
+        title.textContent = '📦 Craft List';
+        title.style.cssText = `
+            margin: 0; font-size: 1.3em; font-weight: bold;
+            background: linear-gradient(90deg, #f472b6, #fbcfe8);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        `;
+
+        const body = contentEl.createEl('div');
+        body.style.cssText = 'padding: 16px 24px 20px; overflow-y: auto; flex: 1;';
+
+        const rarityColor = { UR: '#facc15', SR: '#c084f5', R: '#60a5fa', N: '#94a3b8' };
+
+        for (const { title: sectionTitle, report } of this.sections) {
+            const section = body.createEl('div');
+            section.style.cssText = 'margin-bottom: 22px;';
+
+            const sHeading = section.createEl('div');
+            sHeading.style.cssText = 'display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid #1f2937;';
+            const sTitle = sHeading.createEl('span', { text: sectionTitle });
+            sTitle.style.cssText = 'font-family: monospace; font-weight: bold; font-size: 0.95em; color: #f472b6;';
+
+            if (report.missing.length === 0) {
+                const okLine = section.createEl('div');
+                okLine.textContent = '✅ You already own every card here!';
+                okLine.style.cssText = 'font-family: monospace; font-size: 0.82em; color: #4ade80; padding: 6px 0;';
+                continue;
+            }
+
+            const countBadge = sHeading.createEl('span', { text: `${report.missing.length} missing` });
+            countBadge.style.cssText = 'font-family: monospace; font-size: 0.76em; color: #6b7280;';
+
+            for (const { name, rarity, short } of report.missing) {
+                const row = section.createEl('div');
+                row.style.cssText = 'display: flex; justify-content: space-between; align-items: center; padding: 3px 0; font-family: monospace; font-size: 0.8em;';
+                const nameEl = row.createEl('span');
+                nameEl.style.cssText = 'color: #e2e8f0;';
+                nameEl.textContent = name;
+                const rightEl = row.createEl('span');
+                rightEl.style.cssText = `color: ${rarityColor[rarity] || '#94a3b8'}; white-space: nowrap; margin-left: 12px;`;
+                rightEl.textContent = `[${rarity}]  need ${short} more`;
+            }
+
+            const summary = section.createEl('div');
+            summary.style.cssText = 'margin-top: 8px; padding-top: 6px; border-top: 1px dashed #1f2937; font-family: monospace; font-size: 0.78em; color: #94a3b8;';
+            summary.textContent = `Crafting: ◆ UR ${report.byRarity.UR}  ◇ SR ${report.byRarity.SR}  ● R ${report.byRarity.R}  ○ N ${report.byRarity.N}`;
+        }
     }
 }
 
