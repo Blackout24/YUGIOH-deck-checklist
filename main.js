@@ -13,6 +13,20 @@ const HAND_TRAPS = [
     'Crossout Designator', 'Solemn Judgment', 'Compulsory Evacuation Device',
 ];
 
+// Short/alternate names used in notes -> the exact API name. Shared by fetchCard
+// and the note-line matchers so a line written as "Ash Blossom" still matches
+// the loaded card named "Ash Blossom & Joyous Spring" (add/remove/toggle).
+const CARD_NAME_ALIASES = {
+    'Ash Blossom': 'Ash Blossom & Joyous Spring',
+    'Linkuriboh': 'Linkuriboh',
+    'Strahl': 'Dragonmaid Sheou',
+};
+const CARD_NAME_ALIASES_LC = Object.fromEntries(Object.entries(CARD_NAME_ALIASES).map(([k, v]) => [k.toLowerCase(), v.toLowerCase()]));
+function canonicalCardName(name) {
+    const k = String(name || '').trim().toLowerCase();
+    return CARD_NAME_ALIASES_LC[k] || k;
+}
+
 // The rarity DB used to live here as a hardcoded object. It's now shipped as
 // md-rarities.json (loaded in Plugin.onload → loadDataFiles) so it can be
 // edited without touching code. This is the last-resort fallback if that
@@ -417,7 +431,7 @@ function updateCardCheckbox(content, cardName, owned) {
     const eol = detectEOL(content);
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
-    const target = cardName.trim().toLowerCase();
+    const target = canonicalCardName(cardName);
 
     const updated = lines.map((line, i) => {
         const group = groups[i];
@@ -426,7 +440,7 @@ function updateCardCheckbox(content, cardName, owned) {
         const m = line.match(CARD_LINE_RE);
         if (!m) return line;
         const { name } = parseEntryText(m[2]);
-        if (name.toLowerCase() !== target) return line;
+        if (canonicalCardName(name) !== target) return line;
 
         if (m[1] === undefined) {
             // Bare line with no checkbox yet — add one.
@@ -520,7 +534,7 @@ function upsertCardInTemplate(content, card) {
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
     const groupKey = ['main60', 'main40', 'extra', 'side'].includes(card.deckGroup) ? card.deckGroup : 'main60';
-    const target = card.name.trim().toLowerCase();
+    const target = canonicalCardName(card.name);
     const count = card.count || 1;
     const rarity = card.rarity || 'N';
 
@@ -529,7 +543,7 @@ function upsertCardInTemplate(content, card) {
         const m = lines[i].match(CARD_LINE_RE);
         if (!m) continue;
         const { name } = parseEntryText(m[2]);
-        if (name.toLowerCase() !== target) continue;
+        if (canonicalCardName(name) !== target) continue;
 
         const checkbox = m[1];
         const prefix = checkbox !== undefined ? `- ${checkbox} ` : '- ';
@@ -553,17 +567,17 @@ function decrementCardInTemplate(content, cardName, deckGroup) {
     const eol = detectEOL(content);
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
-    const target = cardName.trim().toLowerCase();
+    const target = canonicalCardName(cardName);
 
     const idx = lines.findIndex((line, i) => {
         if (groups[i] !== deckGroup) return false;
         const m = line.match(CARD_LINE_RE);
         if (!m) return false;
         const { name } = parseEntryText(m[2]);
-        return name.toLowerCase() === target;
+        return canonicalCardName(name) === target;
     });
 
-    if (idx === -1) return { content, removed: false, newCount: 0 };
+    if (idx === -1) return { content, removed: false, newCount: 0, found: false };
 
     const m = lines[idx].match(CARD_LINE_RE);
     const { name, count, rarity } = parseEntryText(m[2]);
@@ -1198,13 +1212,7 @@ class YugiohPlugin extends Plugin {
 
     async fetchCard(name) {
         // Some templates use short names — map them to the exact API name
-        const ALIASES = {
-            'Ash Blossom': 'Ash Blossom & Joyous Spring',
-            'Linkuriboh': 'Linkuriboh',
-            // "Strahl" is Dragonmaid Sheou's Japanese name, not a substring of its
-            // English name — fuzzy search can never find it, only an alias can.
-            'Strahl': 'Dragonmaid Sheou',
-        };
+        const ALIASES = CARD_NAME_ALIASES;
         const normalisedName = name.replace(/–/g, '-').replace(/—/g, '-');
         const resolvedName = ALIASES[normalisedName] || normalisedName;
         try {
@@ -3368,7 +3376,12 @@ class DeckUI extends Modal {
             return;
         }
 
-        const { content: updated, removed, newCount } = decrementCardInTemplate(content, card.name, group);
+        const { content: updated, removed, newCount, found } = decrementCardInTemplate(content, card.name, group);
+        if (found === false) {
+            this.setStatus(` Couldn't find a line for "${card.name}" in ${group} - nothing removed.`);
+            new Notice(`Couldn't find "${card.name}" in the note's ${group} section.`);
+            return;
+        }
         const success = await this.plugin.writeTemplate(updated);
         if (!success) {
             this.setStatus(`❌ Failed to remove "${card.name}" — no active file found.`);
@@ -3571,6 +3584,7 @@ class DeckUI extends Modal {
         };
         mkToggle('🟦 Main Deck (60)', 'main60');
         mkToggle('🟢 40-Card Variant', 'main40');
+        mkToggle('🟨 Side Deck', 'side');
 
         const note = controls.createEl('span');
         note.textContent = '🔍 Heuristic estimate from card text — not exact, use as a rough guide.';
@@ -3580,7 +3594,7 @@ class DeckUI extends Modal {
         if (cards.length === 0) {
             const empty = container.createEl('div');
             empty.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.85em; padding: 30px; text-align: center;';
-            empty.textContent = `No cards loaded in ${this.analysisDeck === 'main40' ? 'the 40-Card Variant' : 'Main Deck'} yet.`;
+            empty.textContent = `No cards loaded in ${this.analysisDeck === 'main40' ? 'the 40-Card Variant' : this.analysisDeck === 'side' ? 'the Side Deck' : 'Main Deck'} yet.`;
             return;
         }
 
