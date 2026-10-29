@@ -1419,12 +1419,55 @@ const RARITY_LABEL = { UR: '◆ UR', SR: '◇ SR', R: '● R', N: '○ N' };
 // on a multi-line capture, which matches end-of-LINE instead of end-of-
 // string and silently truncates after the first line. Nothing here spans
 // lines, so that failure mode doesn't apply.
+// Built-in role overrides per deck note, keyed by note basename (no .md).
+// Lowest priority override: settings.roleOverrides (per note path) wins, then
+// these, then classifyCardRole(). Names are lowercase.
+const DEFAULT_ROLE_OVERRIDES = {
+    'Dragonmaid Deck': {
+        'kitchen dragonmaid': 'starter',
+        'parlor dragonmaid': 'starter',
+        'chamber dragonmaid': 'starter',
+        'nurse dragonmaid': 'starter',
+        'that grass looks greener': 'starter',
+        'branded fusion': 'starter',
+        'foolish burial': 'starter',
+        'rokket tracer': 'starter',
+        'rokket recharger': 'starter',
+        'albion the shrouded dragon': 'searcher',
+        'quick launch': 'searcher',
+        'boot sector launch': 'searcher',
+        'chaos space': 'searcher',
+        'crossout designator': 'searcher',
+        'dragonmaid ernus': 'extender',
+        'dragonmaid lorpar': 'extender',
+        'dragonmaid tinkhec': 'extender',
+        'dragonmaid nudyarl': 'extender',
+        'laundry dragonmaid': 'extender',
+        'monster reborn': 'extender',
+        'bystial magnamhut': 'extender',
+        'bystial druiswurm': 'extender',
+        'white dragon wyverburster': 'extender',
+        'black dragon collapserpent': 'extender',
+        'red-eyes darkness metal dragon': 'extender',
+        'destrudo the lost dragon\'s frisson': 'extender',
+        'super polymerization': 'breaker',
+        'lightning storm': 'breaker',
+        'harpie\'s feather duster': 'breaker',
+        'chaos dragon levianeer': 'breaker',
+        'torrential tribute': 'breaker',
+        'triple tactics talent': 'draw',
+        'infinite impermanence': 'defensive',
+        'solemn judgment': 'defensive',
+        'called by the grave': 'defensive',
+    },
+};
+
 const ROLE_META = {
     starter: { label: '🟢 Starter', color: '#4ade80' },
     extender: { label: '🔵 Extender', color: '#60a5fa' },
-    // Manual-only roles: classifyCardRole() never assigns these, they come from
-    // per-deck overrides. Simulator: searcher counts as a starter; the rest
-    // count as non-brick generic cards.
+    // Assigned automatically by classifyCardRole() and/or per-deck overrides.
+    // Simulator: searcher counts as a starter; the rest count as non-brick
+    // generic cards.
     searcher: { label: '🔎 Searcher', color: '#2dd4bf' },
     draw: { label: '📚 Draw Engine', color: '#a78bfa' },
     handtrap: { label: '🪤 Hand Trap', color: '#f87171' },
@@ -1438,7 +1481,11 @@ function classifyCardRole(card) {
     const type = card.type || '';
     const desc = (card.desc || '').toLowerCase();
     const isMonster = type.includes('Monster');
+    const isSpell = type.includes('Spell');
+    const isTrap = type.includes('Trap');
     const isExtraDeck = /Fusion|Synchro|XYZ|Xyz|Link/.test(type);
+    const GY = '(?:gy|graveyard)';
+    const any = (patterns) => patterns.some(re => re.test(desc));
 
     // Extra Deck monsters are never drawn into an opening hand — the
     // starter/extender/brick concept (which is about hand quality) doesn't
@@ -1447,14 +1494,12 @@ function classifyCardRole(card) {
         return { role: 'other', reason: 'Extra Deck monster — not part of opening-hand odds.' };
     }
 
-    // Known hand traps and hand-trap-style staple disruption (see HAND_TRAPS
-    // comment) — its own bucket, distinct from "Other", since it's a
-    // well-defined disruption role rather than a catch-all.
+    // Known hand traps and hand-trap-style staple disruption (see HAND_TRAPS).
     if (HAND_TRAPS.includes(card.name)) {
         return { role: 'handtrap', reason: 'Disruption/negation staple — not a combo piece.' };
     }
 
-    // ── Brick checks ────────────────────────────────────────────────────────
+    // ── Brick ────────────────────────────────────────────────────────────
     if (isMonster && type.includes('Normal') && !type.includes('Effect')) {
         return { role: 'brick', reason: 'Vanilla Normal Monster — no effect, dead card alone.' };
     }
@@ -1462,52 +1507,72 @@ function classifyCardRole(card) {
         return { role: 'brick', reason: 'Equip Spell — needs a monster already on board to do anything.' };
     }
 
-    // ── Starter checks ──────────────────────────────────────────────────────
+    // ── Draw engine (Spells/Traps whose main effect is drawing) ───────────
+    if (!isMonster && /\bdraw (?:\d+|one|two|three) cards?\b|\bdraw 1 card\b/.test(desc)
+        && !/\badd \d* ?[^.;]*to your hand|special summon/.test(desc)) {
+        return { role: 'draw', reason: 'Draws cards — thins/refills the hand rather than starting a combo.' };
+    }
+
+    // ── Searcher (adds a card from Deck/GY to hand) ──────────────────────
+    const searchPatterns = [
+        new RegExp(`add (?:1|up to \\d+|2|3) [^.;]*from your deck(?: or ${GY})? to your hand`),
+        new RegExp(`add (?:1|up to \\d+|2|3) [^.;]*from your ${GY} to your hand`),
+    ];
+    if (any(searchPatterns)) {
+        return { role: 'searcher', reason: 'Adds a card from your Deck/GY to your hand — gets you to the engine.' };
+    }
+
+    // ── Starter (self-summons / mills into the engine from hand alone) ────
     const starterPatterns = [
         /special summon this card \(from your hand\)/,
         /you can special summon this card from your hand/,
         /can be special summoned.*from your hand/,
-        /add 1 .*from your deck to your hand/,
-        /add .*from your deck or gy to your hand/,
-        /draw 2 cards/,
         /you can only activate this card if you control no other cards/,
         /if you control no other cards, you can/,
-        /special summon 1 .*from your hand/,
+        /special summon 1 [^.;]*from your hand/,
+        /send (?:1|2) [^.;]*from your deck to the (?:gy|graveyard)/,
     ];
-    if (starterPatterns.some(re => re.test(desc))) {
-        return { role: 'starter', reason: 'Searches, draws, or self-summons — usable from an empty board.' };
+    if (any(starterPatterns)) {
+        return { role: 'starter', reason: 'Self-summons or sets up from the Deck — usable from an empty board.' };
     }
 
-    // ── Extender checks ──────────────────────────────────────────────────────
-    // NOTE: real card text (and ygoprodeck's desc field) abbreviates Graveyard
-    // as "GY", not spelled out — e.g. Dragonmaid Tidying reads "You can banish
-    // this card from your GY; Special Summon...". Every pattern below matches
-    // "gy" (with "graveyard" also tolerated defensively, since some
-    // third-party sources spell it out) — an earlier version of this file
-    // only matched "graveyard", which meant these patterns effectively never
-    // fired against real card text and everything GY-reliant fell into
-    // "Other" instead of "Extender".
-    const GY = '(?:gy|graveyard)';
+    // ── Board breaker (mass/targeted removal, control steal) ─────────────
+    const breakerPatterns = [
+        /(?:destroy|banish|return|send) all /,
+        /take control of/,
+        /(?:destroy|banish) (?:up to )?(?:1|2|3|\d+) [^.;]*(?:your opponent controls|on the field)/,
+        /return (?:1|2|3|\d+) [^.;]*(?:your opponent controls|on the field) to the (?:hand|deck)/,
+    ];
+    if (any(breakerPatterns)) {
+        return { role: 'breaker', reason: 'Removes or takes the opponent\'s board — breaks through a set-up.' };
+    }
+
+    // ── Defensive (Traps / Quick-Play Spells that negate or protect) ─────
+    if ((isTrap || type.includes('Quick-Play')) &&
+        /negate|cannot be destroyed|cannot be targeted|unaffected by/.test(desc)) {
+        return { role: 'defensive', reason: 'Negates or protects at instant speed — interaction, not a combo piece.' };
+    }
+
+    // ── Extender ─────────────────────────────────────────────────────────
+    // NOTE: ygoprodeck's desc field abbreviates Graveyard as "GY"; every
+    // pattern below matches "gy" (and "graveyard" defensively).
     const extenderPatterns = [
         new RegExp(`special summon this card from your (?:hand or )?${GY}`),
         new RegExp(`you can banish this card from your ${GY}`),
         new RegExp(`if this card is (?:sent to the ${GY}|destroyed)`),
         new RegExp(`when this card is (?:sent to the ${GY}|destroyed)`),
         new RegExp(`shuffle this card into the deck.*special summon`),
-        new RegExp(`special summon 1 .*from your ${GY}`),
-        // Self-recursion from the GY back to hand (e.g. Dragonmaid Changeover:
-        // "While this card is in your GY: ... add this card to your hand").
+        new RegExp(`special summon 1 [^.;]*from your ${GY}`),
+        // Self-recursion from the GY back to hand (e.g. Dragonmaid Changeover).
         new RegExp(`add this card to your hand`),
-        // Generic revival spells/traps phrased as "target 1 monster in
-        // (either|your) GY; Special Summon it" (e.g. Monster Reborn) rather
-        // than "Special Summon ... from your GY".
+        // Revival spells/traps (e.g. Monster Reborn).
         new RegExp(`target 1 monster in (?:either|your) ${GY}.*special summon`),
     ];
-    if (extenderPatterns.some(re => re.test(desc))) {
+    if (any(extenderPatterns)) {
         return { role: 'extender', reason: 'Recurs or extends from the Graveyard — picks up after a starter.' };
     }
 
-    return { role: 'other', reason: "Doesn't clearly match Starter/Extender/Brick patterns — generic effect." };
+    return { role: 'other', reason: "Doesn't clearly match any role pattern — generic effect." };
 }
 
 class DeckUI extends Modal {
@@ -2049,7 +2114,9 @@ class DeckUI extends Modal {
     getCardRole(card) {
         const file = this.plugin.getActiveFile();
         const overrides = (this.plugin.settings.roleOverrides || {})[file ? file.path : ''];
-        const role = overrides && overrides[(card.name || '').toLowerCase()];
+        const key = (card.name || '').toLowerCase();
+        const builtIn = DEFAULT_ROLE_OVERRIDES[file ? file.basename : ''];
+        const role = (overrides && overrides[key]) || (builtIn && builtIn[key]);
         if (role && ROLE_META[role]) return { role, reason: 'Manual override for this deck.' };
         return classifyCardRole(card);
     }
