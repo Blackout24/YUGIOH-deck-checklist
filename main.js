@@ -42,7 +42,7 @@ const BANLIST_SOURCE_URL = 'https://dawnbrandbots.github.io/yaml-yugi-limit-regu
 // offline stretch doesn't go unnoticed.
 const BANLIST_STALE_DAYS = 30;
 
-const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md' };
+const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {} };
 
 // ── Shared line/section helpers ──────────────────────────────────────────────
 // Recognizes both checkbox styles: "- [ ]"/"- [x]" and "- ☐"/"- ☑".
@@ -2036,15 +2036,26 @@ class DeckUI extends Modal {
         renderHand();
     }
 
+    // Role for a card: a saved per-deck override (settings.roleOverrides,
+    // keyed by note path → lowercase card name → role) wins; otherwise falls
+    // back to the regex heuristic in classifyCardRole().
+    getCardRole(card) {
+        const file = this.plugin.getActiveFile();
+        const overrides = (this.plugin.settings.roleOverrides || {})[file ? file.path : ''];
+        const role = overrides && overrides[(card.name || '').toLowerCase()];
+        if (role && ROLE_META[role]) return { role, reason: 'Manual override for this deck.' };
+        return classifyCardRole(card);
+    }
+
     // Simulates `trials` opening hands drawn from `pool` (already copies-
     // weighted by buildDrawPool) without replacement per hand, classifying
-    // each card with the same classifyCardRole() heuristic the Analysis tab
+    // each card with the same getCardRole() (override → classifyCardRole) the Analysis tab
     // uses. A card's role never changes between copies, so it's cached by
     // name to avoid redundantly re-running the regex checks per copy.
     runConsistencyTest(pool, handSize, trials = 10000) {
         const roleCache = new Map();
         const getRole = (card) => {
-            if (!roleCache.has(card.name)) roleCache.set(card.name, classifyCardRole(card).role);
+            if (!roleCache.has(card.name)) roleCache.set(card.name, this.getCardRole(card).role);
             return roleCache.get(card.name);
         };
 
@@ -3502,7 +3513,7 @@ class DeckUI extends Modal {
         const buckets = { starter: [], extender: [], handtrap: [], brick: [], other: [] };
         let totalCopies = 0;
         for (const card of cards) {
-            const { role, reason } = classifyCardRole(card);
+            const { role, reason } = this.getCardRole(card);
             const copies = card.count || 1;
             totalCopies += copies;
             buckets[role].push({ card, copies, reason });
