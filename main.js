@@ -2016,11 +2016,13 @@ class DeckUI extends Modal {
     // to have any cards", since a note commonly keeps both checklists
     // populated side by side and that silently locked Test Hand onto the
     // variant even when the user was building/testing the 60-card deck.
-    // Extra Deck and Side Deck are never drawn from.
+    // Extra Deck is never drawn from. The Side Deck is added to the pool only
+    // while this.handIncludeSide is on (default on, toggle in the Test Hand tab).
     buildDrawPool() {
         const mainCards = this.decks[this.lastMainDeckTab] || this.decks.main60;
         const pool = [];
-        for (const c of mainCards) {
+        const sources = this.handIncludeSide !== false ? [...mainCards, ...(this.decks.side || [])] : mainCards;
+        for (const c of sources) {
             const copies = c.count || 1;
             for (let i = 0; i < copies; i++) pool.push(c);
         }
@@ -2039,6 +2041,7 @@ class DeckUI extends Modal {
     renderHandSimulator(container) {
         const pool = this.buildDrawPool();
         const usingVariant = this.lastMainDeckTab === 'main40';
+        const sideOn = this.handIncludeSide !== false;
 
         const controls = container.createEl('div');
         controls.style.cssText = `
@@ -2048,9 +2051,16 @@ class DeckUI extends Modal {
         const info = controls.createEl('span');
         info.style.cssText = 'font-size: 0.75em; color: #6b7280; font-family: monospace; margin-right: auto;';
         info.textContent = pool.length > 0
-            ? `Pool: ${pool.length} cards (${usingVariant ? '40-Card Variant' : 'Main Deck'})`
+            ? `Pool: ${pool.length} cards (${usingVariant ? '40-Card Variant' : 'Main Deck'}${sideOn ? ' + Side Deck' : ''})`
             : 'No main deck cards loaded — load a deck first.';
 
+        const sideBtn = this.makeBtn(controls, (sideOn ? '☑ ' : '☐ ') + 'Include Side Deck', sideOn ? '#facc15' : '#374151', sideOn ? '#0d0f1a' : '#9ca3af');
+        sideBtn.onclick = () => {
+            this.handIncludeSide = !sideOn;
+            this.currentHand = null;
+            container.empty();
+            this.renderHandSimulator(container);
+        };
         const draw5Btn = this.makeBtn(controls, '🎲 Draw 5 · Going First', '#e8c84a', '#0d0f1a');
         const draw6Btn = this.makeBtn(controls, '🎲 Draw 6 · Going Second', '#c084f5', '#fff');
         const redrawBtn = this.makeBtn(controls, '🔄 Redraw', '#60a5fa', '#fff');
@@ -3558,7 +3568,7 @@ class DeckUI extends Modal {
     // matching how often you'd actually draw each role — not just unique-card
     // counts. Extra Deck is excluded (see classifyCardRole).
     renderAnalysis(container) {
-        if (!this.analysisDeck) {
+        if (!this.analysisDeck || this.analysisDeck === 'side') {
             this.analysisDeck = this.lastMainDeckTab; // same "last viewed" default as Test Hand/Validate/Craft List, not "the variant, if it happens to be non-empty"
         }
 
@@ -3584,17 +3594,35 @@ class DeckUI extends Modal {
         };
         mkToggle('🟦 Main Deck (60)', 'main60');
         mkToggle('🟢 40-Card Variant', 'main40');
-        mkToggle('🟨 Side Deck', 'side');
+
+        // Optional: fold the Side Deck's cards into the analysis of whichever
+        // main deck is selected (Main 60 + Side, or 40-Card Variant + Side).
+        const sideBtn = controls.createEl('button');
+        const sideOn = this.analysisIncludeSide !== false;
+        sideBtn.textContent = (sideOn ? '☑ ' : '☐ ') + '🟨 Include Side Deck';
+        sideBtn.style.cssText = `
+            background: ${sideOn ? '#facc1522' : '#1f2937'}; color: ${sideOn ? '#facc15' : '#6b7280'};
+            border: 1px solid ${sideOn ? '#facc15' : '#374151'};
+            padding: 6px 13px; border-radius: 6px; cursor: pointer;
+            font-size: 0.8em; font-family: monospace; font-weight: bold;
+        `;
+        sideBtn.onclick = () => {
+            this.analysisIncludeSide = !sideOn;
+            container.empty();
+            this.renderAnalysis(container);
+        };
 
         const note = controls.createEl('span');
         note.textContent = '🔍 Heuristic estimate from card text — not exact, use as a rough guide.';
         note.style.cssText = 'font-size: 0.7em; color: #6b7280; font-family: monospace; margin-left: auto;';
 
-        const cards = this.decks[this.analysisDeck] || [];
-        if (cards.length === 0) {
+        const mainCards = this.decks[this.analysisDeck] || [];
+        const sideCards = sideOn ? (this.decks.side || []).map(c => ({ ...c, _side: true })) : [];
+        const cards = [...mainCards, ...sideCards];
+        if (mainCards.length === 0) {
             const empty = container.createEl('div');
             empty.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.85em; padding: 30px; text-align: center;';
-            empty.textContent = `No cards loaded in ${this.analysisDeck === 'main40' ? 'the 40-Card Variant' : this.analysisDeck === 'side' ? 'the Side Deck' : 'Main Deck'} yet.`;
+            empty.textContent = `No cards loaded in ${this.analysisDeck === 'main40' ? 'the 40-Card Variant' : 'Main Deck'} yet.`;
             return;
         }
 
@@ -3652,7 +3680,7 @@ class DeckUI extends Modal {
                 line.style.cssText = 'display: flex; justify-content: space-between; gap: 10px; padding: 4px 2px; font-family: monospace; font-size: 0.78em;';
                 const nameSpan = line.createEl('span');
                 nameSpan.style.cssText = 'color: #e2e8f0; white-space: nowrap;';
-                nameSpan.textContent = `${card.name} ×${copies}`;
+                nameSpan.textContent = `${card.name} ×${copies}${card._side ? ' (side)' : ''}`;
                 nameSpan.title = reason;
                 const reasonSpan = line.createEl('span');
                 reasonSpan.style.cssText = 'color: #6b7280; text-align: right; flex: 1; min-width: 0;';
