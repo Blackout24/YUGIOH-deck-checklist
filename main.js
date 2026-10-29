@@ -56,7 +56,7 @@ const BANLIST_SOURCE_URL = 'https://dawnbrandbots.github.io/yaml-yugi-limit-regu
 // offline stretch doesn't go unnoticed.
 const BANLIST_STALE_DAYS = 30;
 
-const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {} };
+const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {}, autoSnapshots: true };
 
 // ── Shared line/section helpers ──────────────────────────────────────────────
 // Recognizes both checkbox styles: "- [ ]"/"- [x]" and "- ☐"/"- ☑".
@@ -864,6 +864,100 @@ IN:
 - Adjust based on your collection
 `;
 
+// ── Deck archive / version control ────────────────────────────────────────
+// Snapshots are plain markdown notes (full copy of the deck note + a small
+// frontmatter block) stored in "<deck note folder>/Deck Archive/<deck name>/",
+// next to a Changelog.md for that deck. Nothing is hidden in plugin data, so
+// they sync, search and diff like any other note.
+const ARCHIVE_FOLDER_NAME = 'Deck Archive';
+const SNAP_MARKER = '<!-- yugioh-snapshot-content -->';
+const SNAPSHOT_TAGS = ['experimental', 'ranked', 'budget', 'tournament'];
+const DECK_GROUP_LABEL = { main60: 'Main Deck (60)', main40: '40-Card Variant', extra: 'Extra Deck', side: 'Side Deck' };
+
+function cleanSnapshotTag(t) {
+    return String(t || '').trim().toLowerCase().replace(/^#/, '').replace(/[\s,\[\]]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function buildSnapshotText(meta, content) {
+    return [
+        '---',
+        'yugioh-snapshot: true',
+        `deck: ${JSON.stringify(meta.deck || '')}`,
+        `name: ${JSON.stringify(meta.name || '')}`,
+        `created: ${meta.created}`,
+        `auto: ${meta.auto ? 'true' : 'false'}`,
+        `tags: [${(meta.tags || []).join(', ')}]`,
+        `reason: ${JSON.stringify(meta.reason || '')}`,
+        '---',
+        SNAP_MARKER,
+        '',
+    ].join('\n') + content;
+}
+
+// Returns { meta, content } for a snapshot note, or null if the text isn't one.
+function parseSnapshotText(text) {
+    const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+    if (!fm || !/yugioh-snapshot:\s*true/.test(fm[1])) return null;
+    const meta = { name: '', reason: '', deck: '', created: '', auto: false, tags: [] };
+    for (const line of fm[1].split(/\r?\n/)) {
+        const m = line.match(/^([\w-]+):\s*(.*)$/);
+        if (!m) continue;
+        const k = m[1], v = m[2];
+        if (k === 'name' || k === 'reason' || k === 'deck') {
+            try { meta[k] = JSON.parse(v); } catch (_) { meta[k] = v; }
+        } else if (k === 'created') {
+            meta.created = v.trim();
+        } else if (k === 'auto') {
+            meta.auto = v.trim() === 'true';
+        } else if (k === 'tags') {
+            const t = v.match(/\[(.*)\]/);
+            meta.tags = t ? t[1].split(',').map(x => x.trim()).filter(Boolean) : [];
+        }
+    }
+    const idx = text.indexOf(SNAP_MARKER);
+    if (idx === -1) return null;
+    return { meta, content: text.slice(idx + SNAP_MARKER.length).replace(/^\r?\n/, '') };
+}
+
+// Card-level diff between two deck notes: one row per card whose copy count
+// differs in a deck group. Names are compared via canonicalCardName(), so
+// "Ash Blossom" and "Ash Blossom & Joyous Spring" are the same card.
+function diffDeckContents(aContent, bContent) {
+    const toMap = (content) => {
+        const m = new Map();
+        for (const e of parseCardsFromMarkdown(content || '')) {
+            const key = `${e.deckGroup}|${canonicalCardName(e.name)}`;
+            const prev = m.get(key);
+            m.set(key, { name: e.name, group: e.deckGroup, count: (prev ? prev.count : 0) + (e.count || 1) });
+        }
+        return m;
+    };
+    const A = toMap(aContent), B = toMap(bContent);
+    const rows = [];
+    for (const key of new Set([...A.keys(), ...B.keys()])) {
+        const a = A.get(key), b = B.get(key);
+        const aCount = a ? a.count : 0, bCount = b ? b.count : 0;
+        if (aCount === bCount) continue;
+        rows.push({
+            group: (a || b).group, name: (b || a).name, aCount, bCount,
+            status: aCount === 0 ? 'added' : bCount === 0 ? 'removed' : 'changed',
+        });
+    }
+    const order = ['main60', 'main40', 'extra', 'side'];
+    rows.sort((x, y) => order.indexOf(x.group) - order.indexOf(y.group) || x.name.localeCompare(y.name));
+    return rows;
+}
+
+function summarizeDiff(rows) {
+    const n = (s) => rows.filter(r => r.status === s).length;
+    return rows.length === 0 ? 'no card changes' : `+${n('added')} −${n('removed')} ~${n('changed')} cards`;
+}
+
+function formatStamp(d, withSeconds) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}${withSeconds ? '' : ':'}${p(d.getMinutes())}${withSeconds ? p(d.getSeconds()) : ''}`;
+}
+
 class YugiohPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
@@ -903,6 +997,25 @@ class YugiohPlugin extends Plugin {
             id: 'update-banlist',
             name: '🔄 Check for Master Duel Banlist Update',
             callback: () => this.updateBanlistFromSource(true)
+        });
+        this.addCommand({
+            id: 'open-deck-versions',
+            name: '🗂️ Deck Versions (save / compare / restore)',
+            callback: () => {
+                const file = this.getActiveFile();
+                if (!file) { new Notice('Open a deck note first.'); return; }
+                new VersionsUI(this.app, this, file).open();
+            }
+        });
+        this.addCommand({
+            id: 'quick-deck-snapshot',
+            name: '🗂️ Quick snapshot of current deck note',
+            callback: async () => {
+                const file = this.getActiveFile();
+                if (!file) { new Notice('Open a deck note first.'); return; }
+                const snap = await this.createSnapshot(file, { name: 'Quick snapshot' });
+                new Notice(`🗂️ Saved "${snap.meta.name}"`);
+            }
         });
         // Auto-refresh the Master Duel banlist in the background on every
         // launch. It's one small request to a daily-updated community feed
@@ -1150,6 +1263,106 @@ class YugiohPlugin extends Plugin {
             return;
         }
         await this.app.workspace.getLeaf(false).openFile(file);
+    }
+
+    // ── Deck archive / version control ───────────────────────────────────
+    getArchiveFolderPath(file) {
+        const parent = file.parent && file.parent.path && file.parent.path !== '/' ? `${file.parent.path}/` : '';
+        return `${parent}${ARCHIVE_FOLDER_NAME}/${file.basename}`;
+    }
+
+    getChangelogFile(file) {
+        const f = this.app.vault.getAbstractFileByPath(`${this.getArchiveFolderPath(file)}/Changelog.md`);
+        return f instanceof TFile ? f : null;
+    }
+
+    async ensureFolder(path) {
+        const vault = this.app.vault;
+        let cur = '';
+        for (const part of path.split('/').filter(Boolean)) {
+            cur = cur ? `${cur}/${part}` : part;
+            if (!vault.getAbstractFileByPath(cur)) {
+                try { await vault.createFolder(cur); } catch (_) { /* created concurrently */ }
+            }
+        }
+    }
+
+    // Every snapshot of a deck note, newest first: [{ file, meta, content }].
+    async listSnapshots(file) {
+        const folder = this.app.vault.getAbstractFileByPath(this.getArchiveFolderPath(file));
+        const out = [];
+        if (!folder || !folder.children) return out;
+        for (const child of folder.children) {
+            if (!(child instanceof TFile) || child.extension !== 'md') continue;
+            const parsed = parseSnapshotText(await this.app.vault.read(child));
+            if (parsed) out.push({ file: child, meta: parsed.meta, content: parsed.content });
+        }
+        out.sort((a, b) => (b.meta.created || '').localeCompare(a.meta.created || ''));
+        return out;
+    }
+
+    async createSnapshot(file, { name = '', reason = '', tags = [], auto = false } = {}) {
+        const vault = this.app.vault;
+        const content = await vault.read(file);
+        const existing = await this.listSnapshots(file);
+        const manualCount = existing.filter(s => !s.meta.auto).length;
+        const finalName = name.trim() || (auto ? 'Auto snapshot' : `v${manualCount + 1}`);
+        const now = new Date();
+        const safe = finalName.replace(/[\\/:*?"<>|#^\[\]]/g, '-').slice(0, 60);
+        const folder = this.getArchiveFolderPath(file);
+        await this.ensureFolder(folder);
+
+        const stamp = formatStamp(now, true);
+        let path = `${folder}/${stamp} - ${safe}.md`;
+        for (let n = 2; vault.getAbstractFileByPath(path); n++) path = `${folder}/${stamp} - ${safe} (${n}).md`;
+
+        const meta = {
+            deck: file.basename, name: finalName, created: now.toISOString(), auto,
+            tags: [...new Set(tags.map(cleanSnapshotTag).filter(Boolean))], reason: reason.trim(),
+        };
+        const snapFile = await vault.create(path, buildSnapshotText(meta, content));
+        const prev = existing[0];
+        await this.appendChangelog(file, meta, prev ? summarizeDiff(diffDeckContents(prev.content, content)) : 'first snapshot');
+        return { file: snapFile, meta, content };
+    }
+
+    // Snapshot before a significant change. Skipped when nothing changed since
+    // the latest snapshot, or when auto-snapshots are turned off (unless forced
+    // for destructive actions like applying the blank template / restoring).
+    async autoSnapshot(file, reason, force = false) {
+        if (!file) return null;
+        if (!force && this.settings.autoSnapshots === false) return null;
+        try {
+            const content = await this.app.vault.read(file);
+            const latest = (await this.listSnapshots(file))[0];
+            if (latest && latest.content === content) return null;
+            return await this.createSnapshot(file, { name: `Auto: ${reason}`, reason, auto: true });
+        } catch (err) {
+            console.error('[YugiohPlugin] autoSnapshot failed:', err);
+            return null;
+        }
+    }
+
+    async appendChangelog(file, meta, summary) {
+        const vault = this.app.vault;
+        const path = `${this.getArchiveFolderPath(file)}/Changelog.md`;
+        const tagText = meta.tags && meta.tags.length ? ' ' + meta.tags.map(t => `#${t}`).join(' ') : '';
+        const line = `- ${formatStamp(new Date(meta.created), false)} — **${meta.name}**${meta.auto ? ' _(auto)_' : ''}${tagText}${meta.reason ? ` — ${meta.reason}` : ''} · ${summary}`;
+        const existing = vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) {
+            const cur = await vault.read(existing);
+            await vault.modify(existing, cur.replace(/\s*$/, '\n') + line + '\n');
+        } else {
+            await vault.create(path, `# Changelog — ${file.basename}\n\nOldest first. Each entry is a full copy of the note saved in this folder.\n\n${line}\n`);
+        }
+    }
+
+    async restoreSnapshot(file, snap) {
+        await this.autoSnapshot(file, `Before restoring "${snap.meta.name}"`, true);
+        await this.app.vault.modify(file, snap.content);
+        await this.appendChangelog(file, {
+            name: `Restored "${snap.meta.name}"`, created: new Date().toISOString(), auto: false, tags: [], reason: '',
+        }, 'restore');
     }
 
     async createDeckTemplate() {
@@ -1661,6 +1874,8 @@ class DeckUI extends Modal {
         const validateBtn = this.makeBtn(searchRow, '✅ Validate', '#4ade80', '#0d0f1a');
         const craftBtn = this.makeBtn(searchRow, '📦 Craft List', '#f472b6', '#fff');
         craftBtn.title = 'What you still need to craft, based on your Collection note';
+        const versionsBtn = this.makeBtn(searchRow, '🗂️ Versions', '#312e81', '#c7d2fe');
+        versionsBtn.title = 'Save, compare and restore named versions of this deck note';
         const applyTplBtn = this.makeBtn(searchRow, '🗋 Apply Template', '#1f2937', '#f87171');
         applyTplBtn.title = 'Overwrite the current note with the blank deck template';
 
@@ -1761,6 +1976,7 @@ class DeckUI extends Modal {
         statsBtn.onclick = () => this.showStats();
         validateBtn.onclick = () => this.showValidation();
         craftBtn.onclick = () => this.showCraftList();
+        versionsBtn.onclick = () => this.openVersions();
         applyTplBtn.onclick = () => this.confirmApplyTemplate();
 
         // Auto-load on open
@@ -2441,6 +2657,7 @@ class DeckUI extends Modal {
     // the exact same move with the lists swapped.
     async applySidingPattern(pattern) {
         const isApplied = this.appliedSidingPatterns.has(pattern.matchup);
+        await this.plugin.autoSnapshot(this.plugin.getActiveFile(), `Before siding ${isApplied ? 'revert' : 'in'}: ${pattern.matchup}`);
         const ok = isApplied
             ? await this.applySidingChange(pattern.in, pattern.out)
             : await this.applySidingChange(pattern.out, pattern.in);
@@ -3352,6 +3569,7 @@ class DeckUI extends Modal {
     }
 
     async saveCardToTemplate(card) {
+        await this.ensureSessionSnapshot();
         const content = await this.plugin.readTemplate();
         if (!content) {
             this.setStatus(`⚠️ Could not read the active file — "${card.name}" was not saved.`);
@@ -3380,6 +3598,7 @@ class DeckUI extends Modal {
         const group = card.deckGroup;
         if (!this.decks[group]) return;
 
+        await this.ensureSessionSnapshot();
         const content = await this.plugin.readTemplate();
         if (!content) {
             this.setStatus(`⚠️ Could not read the active file — "${card.name}" was not removed.`);
@@ -3828,6 +4047,25 @@ class DeckUI extends Modal {
         }
     }
 
+    // Opens the Deck Versions window for the active note; reloads the builder
+    // after a restore so tiles reflect the restored file.
+    openVersions() {
+        const file = this.plugin.getActiveFile();
+        if (!file) return new Notice(' No note is currently open. Open a note first.');
+        new VersionsUI(this.app, this.plugin, file, async () => {
+            this.collectionMap = await this.plugin.loadCollectionMap();
+            await this.loadFromTemplate();
+        }).open();
+    }
+
+    // One auto-snapshot per Deck Builder session, taken just before the first
+    // card add/remove (skipped if the note is unchanged since the last snapshot).
+    async ensureSessionSnapshot() {
+        if (this._sessionSnapshotDone) return;
+        this._sessionSnapshotDone = true;
+        await this.plugin.autoSnapshot(this.plugin.getActiveFile(), 'Before editing in Deck Builder');
+    }
+
     confirmApplyTemplate() {
         const file = this.plugin.getActiveFile();
         if (!file) {
@@ -3866,6 +4104,7 @@ class DeckUI extends Modal {
         `;
         confirmBtn.onclick = async () => {
             modal.close();
+            await this.plugin.autoSnapshot(file, 'Before applying blank template', true);
             const success = await this.plugin.writeTemplate(DECK_TEMPLATE);
             if (success) {
                 // Reset UI state — the note is now a blank template
@@ -3883,6 +4122,287 @@ class DeckUI extends Modal {
         };
 
         modal.open();
+    }
+}
+
+// Deck Versions window: save named versions (with notes + tags), compare any
+// version against the current note or another version, restore, open the
+// per-deck changelog. See "Deck archive / version control" near the top.
+class VersionsUI extends Modal {
+    constructor(app, plugin, file, onChange) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+        this.onChange = onChange || (async () => { });
+        this.snaps = [];
+        this.tagFilter = null;
+        this.compare = null; // { aIdx, bKey } — bKey is 'current' or a snapshot index (string)
+        this.formName = '';
+        this.formReason = '';
+        this.formTags = new Set();
+    }
+
+    async onOpen() {
+        this.modalEl.style.width = '820px';
+        this.modalEl.style.maxWidth = '95vw';
+        this.modalEl.style.maxHeight = '90vh';
+        const { contentEl } = this;
+        contentEl.style.cssText = `
+            background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif;
+            padding: 0; display: flex; flex-direction: column; height: 80vh;
+        `;
+
+        const header = contentEl.createEl('div');
+        header.style.cssText = `
+            background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%);
+            padding: 16px 24px 12px; border-bottom: 2px solid #a5b4fc44; flex-shrink: 0;
+        `;
+        const title = header.createEl('h1');
+        title.textContent = '🗂️ Deck Versions';
+        title.style.cssText = `
+            margin: 0 0 3px; font-size: 1.35em; font-weight: bold;
+            background: linear-gradient(90deg, #a5b4fc, #f5c3ff);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        `;
+        const sub = header.createEl('p');
+        sub.style.cssText = 'margin: 0; font-size: 0.72em; color: #94a3b8; font-family: monospace;';
+        sub.textContent = `📄 ${this.file.path}  •  Snapshots: ${this.plugin.getArchiveFolderPath(this.file)}/`;
+
+        this.body = contentEl.createEl('div');
+        this.body.style.cssText = 'padding: 14px 22px 20px; overflow-y: auto; flex: 1;';
+        await this.reload();
+    }
+
+    async reload() {
+        this.snaps = await this.plugin.listSnapshots(this.file);
+        await this.render();
+    }
+
+    mkBtn(parent, label, bg, color, title) {
+        const b = parent.createEl('button');
+        b.textContent = label;
+        if (title) b.title = title;
+        b.style.cssText = `
+            background: ${bg}; color: ${color}; border: 1px solid ${color}55;
+            padding: 5px 11px; border-radius: 6px; cursor: pointer;
+            font-size: 0.78em; font-family: monospace; font-weight: bold;
+        `;
+        return b;
+    }
+
+    mkChip(parent, text, color) {
+        const c = parent.createEl('span');
+        c.textContent = text;
+        c.style.cssText = `font-size: 0.68em; font-family: monospace; padding: 1px 7px; border-radius: 10px; color: ${color}; border: 1px solid ${color}66; background: ${color}18;`;
+        return c;
+    }
+
+    async render() {
+        const body = this.body;
+        body.empty();
+        const inputCss = 'background: #111827; color: #e2e8f0; border: 1px solid #374151; border-radius: 6px; padding: 7px 10px; font-family: monospace; font-size: 0.82em; width: 100%; box-sizing: border-box;';
+
+        // ── Save a new version ───────────────────────────────────────────
+        const form = body.createEl('div');
+        form.style.cssText = 'background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 8px;';
+        const formTitle = form.createEl('div', { text: '💾 Save current note as a version' });
+        formTitle.style.cssText = 'font-family: monospace; font-size: 0.8em; font-weight: bold; color: #a5b4fc;';
+
+        const nameIn = form.createEl('input');
+        nameIn.placeholder = 'Version name (blank = v1, v2, …)';
+        nameIn.value = this.formName;
+        nameIn.style.cssText = inputCss;
+        nameIn.oninput = () => { this.formName = nameIn.value; };
+
+        const reasonIn = form.createEl('input');
+        reasonIn.placeholder = 'Why this change? (saved in the version and the changelog)';
+        reasonIn.value = this.formReason;
+        reasonIn.style.cssText = inputCss;
+        reasonIn.oninput = () => { this.formReason = reasonIn.value; };
+
+        const tagRow = form.createEl('div');
+        tagRow.style.cssText = 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center;';
+        const tagNames = [...new Set([...SNAPSHOT_TAGS, ...this.formTags])];
+        for (const t of tagNames) {
+            const on = this.formTags.has(t);
+            const b = this.mkBtn(tagRow, `#${t}`, on ? '#a5b4fc33' : '#1f2937', on ? '#a5b4fc' : '#6b7280');
+            b.onclick = () => { on ? this.formTags.delete(t) : this.formTags.add(t); this.render(); };
+        }
+        const customIn = tagRow.createEl('input');
+        customIn.placeholder = '+ custom tag ↵';
+        customIn.style.cssText = inputCss + ' width: 130px;';
+        customIn.onkeydown = (e) => {
+            if (e.key !== 'Enter') return;
+            const t = cleanSnapshotTag(customIn.value);
+            if (t) { this.formTags.add(t); this.render(); }
+        };
+
+        const saveBtn = this.mkBtn(form, '💾 Save version', '#a5b4fc', '#0d0f1a');
+        saveBtn.style.alignSelf = 'flex-start';
+        saveBtn.onclick = async () => {
+            saveBtn.disabled = true;
+            try {
+                const snap = await this.plugin.createSnapshot(this.file, {
+                    name: this.formName, reason: this.formReason, tags: [...this.formTags],
+                });
+                new Notice(`🗂️ Saved "${snap.meta.name}"`);
+                this.formName = ''; this.formReason = ''; this.formTags = new Set();
+                await this.reload();
+            } catch (err) {
+                console.error(err);
+                new Notice(`Could not save version: ${err.message}`);
+                saveBtn.disabled = false;
+            }
+        };
+
+        // ── Toolbar: tag filter + changelog ──────────────────────────────
+        const bar = body.createEl('div');
+        bar.style.cssText = 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 10px;';
+        const countLbl = bar.createEl('span', { text: `${this.snaps.length} version${this.snaps.length === 1 ? '' : 's'}` });
+        countLbl.style.cssText = 'font-family: monospace; font-size: 0.75em; color: #6b7280; margin-right: 6px;';
+        const allTags = [...new Set(this.snaps.flatMap(s => s.meta.tags))];
+        if (allTags.length) {
+            const allB = this.mkBtn(bar, 'all', !this.tagFilter ? '#a5b4fc33' : '#1f2937', !this.tagFilter ? '#a5b4fc' : '#6b7280');
+            allB.onclick = () => { this.tagFilter = null; this.render(); };
+            for (const t of allTags) {
+                const on = this.tagFilter === t;
+                const b = this.mkBtn(bar, `#${t}`, on ? '#a5b4fc33' : '#1f2937', on ? '#a5b4fc' : '#6b7280');
+                b.onclick = () => { this.tagFilter = on ? null : t; this.render(); };
+            }
+        }
+        const logBtn = this.mkBtn(bar, '📜 Changelog', '#1f2937', '#fbbf24', 'Open the changelog note for this deck');
+        logBtn.style.marginLeft = 'auto';
+        logBtn.onclick = async () => {
+            const f = this.plugin.getChangelogFile(this.file);
+            if (!f) { new Notice('No changelog yet — save a version first.'); return; }
+            this.close();
+            await this.app.workspace.getLeaf(false).openFile(f);
+        };
+
+        // ── Compare panel ────────────────────────────────────────────────
+        if (this.compare && this.snaps[this.compare.aIdx]) await this.renderCompare(body);
+
+        // ── Version list ─────────────────────────────────────────────────
+        const list = body.createEl('div');
+        list.style.cssText = 'display: flex; flex-direction: column; gap: 8px;';
+        let shown = 0;
+        this.snaps.forEach((snap, i) => {
+            if (this.tagFilter && !snap.meta.tags.includes(this.tagFilter)) return;
+            shown++;
+            const card = list.createEl('div');
+            card.style.cssText = `background: #111827; border: 1px solid ${snap.meta.auto ? '#1f2937' : '#a5b4fc55'}; border-radius: 8px; padding: 10px 14px;`;
+
+            const top = card.createEl('div');
+            top.style.cssText = 'display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;';
+            const nm = top.createEl('span', { text: snap.meta.name || '(unnamed)' });
+            nm.style.cssText = `font-family: monospace; font-weight: bold; font-size: 0.88em; color: ${snap.meta.auto ? '#94a3b8' : '#e2e8f0'};`;
+            if (snap.meta.auto) this.mkChip(top, 'auto', '#6b7280');
+            for (const t of snap.meta.tags) this.mkChip(top, `#${t}`, '#a5b4fc');
+            const when = top.createEl('span', { text: snap.meta.created ? new Date(snap.meta.created).toLocaleString() : '' });
+            when.style.cssText = 'font-family: monospace; font-size: 0.7em; color: #6b7280; margin-left: auto;';
+
+            if (snap.meta.reason) {
+                const r = card.createEl('div', { text: snap.meta.reason });
+                r.style.cssText = 'font-size: 0.8em; color: #94a3b8; margin-top: 4px; font-style: italic;';
+            }
+
+            const actions = card.createEl('div');
+            actions.style.cssText = 'display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;';
+            const cmpBtn = this.mkBtn(actions, '⚖️ Compare', '#1f2937', '#60a5fa', 'Card differences vs the current note (change the target in the panel)');
+            cmpBtn.onclick = async () => { this.compare = { aIdx: i, bKey: 'current' }; await this.render(); this.body.scrollTop = 0; };
+
+            const restoreBtn = this.mkBtn(actions, '↩️ Restore', '#1f2937', '#4ade80', 'Replace the current note with this version (the current note is snapshotted first)');
+            let armed = false;
+            restoreBtn.onclick = async () => {
+                if (!armed) {
+                    armed = true;
+                    restoreBtn.textContent = '❗ Click again to restore';
+                    setTimeout(() => { armed = false; restoreBtn.textContent = '↩️ Restore'; }, 3000);
+                    return;
+                }
+                restoreBtn.disabled = true;
+                try {
+                    await this.plugin.restoreSnapshot(this.file, snap);
+                    new Notice(`↩️ Restored "${snap.meta.name}"`);
+                    await this.onChange();
+                    await this.reload();
+                } catch (err) {
+                    console.error(err);
+                    new Notice(`Restore failed: ${err.message}`);
+                    restoreBtn.disabled = false;
+                }
+            };
+
+            const openBtn = this.mkBtn(actions, '📄 Open', '#1f2937', '#94a3b8', 'Open this snapshot note');
+            openBtn.onclick = async () => { this.close(); await this.app.workspace.getLeaf(false).openFile(snap.file); };
+        });
+
+        if (shown === 0) {
+            const empty = list.createEl('div', { text: this.snaps.length === 0
+                ? 'No versions yet. Save one above — auto-snapshots are also taken before big changes (applying the blank template, siding, and the first edit of a Deck Builder session).'
+                : 'No versions with that tag.' });
+            empty.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.82em; padding: 24px; text-align: center;';
+        }
+    }
+
+    async renderCompare(body) {
+        const { aIdx } = this.compare;
+        const a = this.snaps[aIdx];
+        const panel = body.createEl('div');
+        panel.style.cssText = 'background: #0b1220; border: 1px solid #60a5fa66; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;';
+
+        const head = panel.createEl('div');
+        head.style.cssText = 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; font-family: monospace; font-size: 0.8em;';
+        head.createEl('span', { text: `⚖️ ${a.meta.name}  →` }).style.cssText = 'color: #60a5fa; font-weight: bold;';
+
+        const sel = head.createEl('select');
+        sel.style.cssText = 'background: #111827; color: #e2e8f0; border: 1px solid #374151; border-radius: 6px; padding: 4px 8px; font-family: monospace; font-size: 0.95em;';
+        const curOpt = sel.createEl('option', { text: 'Current note' }); curOpt.value = 'current';
+        this.snaps.forEach((s, i) => {
+            if (i === aIdx) return;
+            const o = sel.createEl('option', { text: s.meta.name || '(unnamed)' }); o.value = String(i);
+        });
+        sel.value = this.compare.bKey;
+        sel.onchange = async () => { this.compare.bKey = sel.value; await this.render(); };
+
+        const closeBtn = this.mkBtn(head, '✕ Close', '#1f2937', '#94a3b8');
+        closeBtn.style.marginLeft = 'auto';
+        closeBtn.onclick = async () => { this.compare = null; await this.render(); };
+
+        let bContent, bName;
+        if (this.compare.bKey === 'current') {
+            bContent = await this.app.vault.read(this.file);
+            bName = 'Current note';
+        } else {
+            const b = this.snaps[parseInt(this.compare.bKey, 10)];
+            bContent = b ? b.content : '';
+            bName = b ? b.meta.name : '?';
+        }
+        const rows = diffDeckContents(a.content, bContent);
+
+        const summary = panel.createEl('div', { text: summarizeDiff(rows) });
+        summary.style.cssText = 'font-family: monospace; font-size: 0.75em; color: #94a3b8; margin-bottom: 8px;';
+        if (rows.length === 0) return;
+
+        const table = panel.createEl('div');
+        table.style.cssText = 'display: grid; grid-template-columns: 1fr 90px 90px; gap: 2px 10px; font-family: monospace; font-size: 0.78em; max-height: 280px; overflow-y: auto;';
+        const th = (t) => { const c = table.createEl('div', { text: t }); c.style.cssText = 'color: #6b7280; font-weight: bold; padding-bottom: 4px; border-bottom: 1px solid #1f2937; position: sticky; top: 0; background: #0b1220;'; };
+        th('Card'); th(a.meta.name.slice(0, 12)); th(bName.slice(0, 12));
+
+        const COLORS = { added: '#4ade80', removed: '#f87171', changed: '#facc15' };
+        let lastGroup = null;
+        for (const r of rows) {
+            if (r.group !== lastGroup) {
+                lastGroup = r.group;
+                const g = table.createEl('div', { text: DECK_GROUP_LABEL[r.group] || r.group });
+                g.style.cssText = 'grid-column: 1 / -1; color: #a5b4fc; font-weight: bold; margin-top: 6px;';
+            }
+            const col = COLORS[r.status];
+            const n = table.createEl('div', { text: `${r.status === 'added' ? '+' : r.status === 'removed' ? '−' : '~'} ${r.name}` });
+            n.style.cssText = `color: ${col};`;
+            table.createEl('div', { text: r.aCount ? `×${r.aCount}` : '—' }).style.cssText = `color: ${r.aCount ? '#e2e8f0' : '#4b5563'};`;
+            table.createEl('div', { text: r.bCount ? `×${r.bCount}` : '—' }).style.cssText = `color: ${r.bCount ? '#e2e8f0' : '#4b5563'};`;
+        }
     }
 }
 
@@ -4262,6 +4782,18 @@ class YugiohSettingTab extends PluginSettingTab {
             .addButton(btn => btn
                 .setButtonText('📂 Open Note')
                 .onClick(() => this.plugin.openCollectionNote())
+            );
+
+        containerEl.createEl('h3', { text: '🗂️ Deck Archive' });
+        containerEl.createEl('p', {
+            text: 'Snapshots and a changelog for each deck are saved as notes in a "Deck Archive" folder next to the deck note. Open them from the Deck Builder (🗂️ Versions) or the "Deck Versions" command.'
+        });
+        new Setting(containerEl)
+            .setName('Auto-snapshot before big changes')
+            .setDesc('Saves a snapshot before applying the blank template, siding in/out, and the first card edit of each Deck Builder session. (Applying the blank template and restoring always snapshot first.)')
+            .addToggle(t => t
+                .setValue(this.plugin.settings.autoSnapshots !== false)
+                .onChange(async (v) => { this.plugin.settings.autoSnapshots = v; await this.plugin.saveSettings(); })
             );
 
         containerEl.createEl('h3', { text: '🚫 Master Duel Banlist' });
