@@ -13,6 +13,20 @@ const HAND_TRAPS = [
     'Crossout Designator', 'Solemn Judgment', 'Compulsory Evacuation Device',
 ];
 
+// Short/alternate names used in notes -> the exact API name. Shared by fetchCard
+// and the note-line matchers so a line written as "Ash Blossom" still matches
+// the loaded card named "Ash Blossom & Joyous Spring" (add/remove/toggle).
+const CARD_NAME_ALIASES = {
+    'Ash Blossom': 'Ash Blossom & Joyous Spring',
+    'Linkuriboh': 'Linkuriboh',
+    'Strahl': 'Dragonmaid Sheou',
+};
+const CARD_NAME_ALIASES_LC = Object.fromEntries(Object.entries(CARD_NAME_ALIASES).map(([k, v]) => [k.toLowerCase(), v.toLowerCase()]));
+function canonicalCardName(name) {
+    const k = String(name || '').trim().toLowerCase();
+    return CARD_NAME_ALIASES_LC[k] || k;
+}
+
 // The rarity DB used to live here as a hardcoded object. It's now shipped as
 // md-rarities.json (loaded in Plugin.onload → loadDataFiles) so it can be
 // edited without touching code. This is the last-resort fallback if that
@@ -42,7 +56,7 @@ const BANLIST_SOURCE_URL = 'https://dawnbrandbots.github.io/yaml-yugi-limit-regu
 // offline stretch doesn't go unnoticed.
 const BANLIST_STALE_DAYS = 30;
 
-const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md' };
+const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {} };
 
 // ── Shared line/section helpers ──────────────────────────────────────────────
 // Recognizes both checkbox styles: "- [ ]"/"- [x]" and "- ☐"/"- ☑".
@@ -417,7 +431,7 @@ function updateCardCheckbox(content, cardName, owned) {
     const eol = detectEOL(content);
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
-    const target = cardName.trim().toLowerCase();
+    const target = canonicalCardName(cardName);
 
     const updated = lines.map((line, i) => {
         const group = groups[i];
@@ -426,7 +440,7 @@ function updateCardCheckbox(content, cardName, owned) {
         const m = line.match(CARD_LINE_RE);
         if (!m) return line;
         const { name } = parseEntryText(m[2]);
-        if (name.toLowerCase() !== target) return line;
+        if (canonicalCardName(name) !== target) return line;
 
         if (m[1] === undefined) {
             // Bare line with no checkbox yet — add one.
@@ -520,7 +534,7 @@ function upsertCardInTemplate(content, card) {
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
     const groupKey = ['main60', 'main40', 'extra', 'side'].includes(card.deckGroup) ? card.deckGroup : 'main60';
-    const target = card.name.trim().toLowerCase();
+    const target = canonicalCardName(card.name);
     const count = card.count || 1;
     const rarity = card.rarity || 'N';
 
@@ -529,7 +543,7 @@ function upsertCardInTemplate(content, card) {
         const m = lines[i].match(CARD_LINE_RE);
         if (!m) continue;
         const { name } = parseEntryText(m[2]);
-        if (name.toLowerCase() !== target) continue;
+        if (canonicalCardName(name) !== target) continue;
 
         const checkbox = m[1];
         const prefix = checkbox !== undefined ? `- ${checkbox} ` : '- ';
@@ -553,17 +567,17 @@ function decrementCardInTemplate(content, cardName, deckGroup) {
     const eol = detectEOL(content);
     const lines = splitLines(content);
     const groups = computeLineGroups(lines);
-    const target = cardName.trim().toLowerCase();
+    const target = canonicalCardName(cardName);
 
     const idx = lines.findIndex((line, i) => {
         if (groups[i] !== deckGroup) return false;
         const m = line.match(CARD_LINE_RE);
         if (!m) return false;
         const { name } = parseEntryText(m[2]);
-        return name.toLowerCase() === target;
+        return canonicalCardName(name) === target;
     });
 
-    if (idx === -1) return { content, removed: false, newCount: 0 };
+    if (idx === -1) return { content, removed: false, newCount: 0, found: false };
 
     const m = lines[idx].match(CARD_LINE_RE);
     const { name, count, rarity } = parseEntryText(m[2]);
@@ -1198,13 +1212,7 @@ class YugiohPlugin extends Plugin {
 
     async fetchCard(name) {
         // Some templates use short names — map them to the exact API name
-        const ALIASES = {
-            'Ash Blossom': 'Ash Blossom & Joyous Spring',
-            'Linkuriboh': 'Linkuriboh',
-            // "Strahl" is Dragonmaid Sheou's Japanese name, not a substring of its
-            // English name — fuzzy search can never find it, only an alias can.
-            'Strahl': 'Dragonmaid Sheou',
-        };
+        const ALIASES = CARD_NAME_ALIASES;
         const normalisedName = name.replace(/–/g, '-').replace(/—/g, '-');
         const resolvedName = ALIASES[normalisedName] || normalisedName;
         try {
@@ -1419,10 +1427,60 @@ const RARITY_LABEL = { UR: '◆ UR', SR: '◇ SR', R: '● R', N: '○ N' };
 // on a multi-line capture, which matches end-of-LINE instead of end-of-
 // string and silently truncates after the first line. Nothing here spans
 // lines, so that failure mode doesn't apply.
+// Built-in role overrides per deck note, keyed by note basename (no .md).
+// Lowest priority override: settings.roleOverrides (per note path) wins, then
+// these, then classifyCardRole(). Names are lowercase.
+const DEFAULT_ROLE_OVERRIDES = {
+    'Dragonmaid Deck': {
+        'kitchen dragonmaid': 'starter',
+        'parlor dragonmaid': 'starter',
+        'chamber dragonmaid': 'starter',
+        'nurse dragonmaid': 'starter',
+        'that grass looks greener': 'starter',
+        'branded fusion': 'starter',
+        'foolish burial': 'starter',
+        'rokket tracer': 'starter',
+        'rokket recharger': 'starter',
+        'albion the shrouded dragon': 'searcher',
+        'quick launch': 'searcher',
+        'boot sector launch': 'searcher',
+        'chaos space': 'searcher',
+        'crossout designator': 'searcher',
+        'dragonmaid ernus': 'extender',
+        'dragonmaid lorpar': 'extender',
+        'dragonmaid tinkhec': 'extender',
+        'dragonmaid nudyarl': 'extender',
+        'laundry dragonmaid': 'extender',
+        'monster reborn': 'extender',
+        'bystial magnamhut': 'extender',
+        'bystial druiswurm': 'extender',
+        'white dragon wyverburster': 'extender',
+        'black dragon collapserpent': 'extender',
+        'red-eyes darkness metal dragon': 'extender',
+        'destrudo the lost dragon\'s frisson': 'extender',
+        'super polymerization': 'breaker',
+        'lightning storm': 'breaker',
+        'harpie\'s feather duster': 'breaker',
+        'chaos dragon levianeer': 'breaker',
+        'torrential tribute': 'breaker',
+        'triple tactics talent': 'draw',
+        'infinite impermanence': 'defensive',
+        'solemn judgment': 'defensive',
+        'called by the grave': 'defensive',
+    },
+};
+
 const ROLE_META = {
     starter: { label: '🟢 Starter', color: '#4ade80' },
     extender: { label: '🔵 Extender', color: '#60a5fa' },
+    // Assigned automatically by classifyCardRole() and/or per-deck overrides.
+    // Simulator: searcher counts as a starter; the rest count as non-brick
+    // generic cards.
+    searcher: { label: '🔎 Searcher', color: '#2dd4bf' },
+    draw: { label: '📚 Draw Engine', color: '#a78bfa' },
     handtrap: { label: '🪤 Hand Trap', color: '#f87171' },
+    breaker: { label: '💥 Board Breaker', color: '#fb923c' },
+    defensive: { label: '🛡️ Defensive', color: '#facc15' },
     brick: { label: '🟤 Brick', color: '#a8a29e' },
     other: { label: '⚪ Other', color: '#94a3b8' },
 };
@@ -1431,7 +1489,11 @@ function classifyCardRole(card) {
     const type = card.type || '';
     const desc = (card.desc || '').toLowerCase();
     const isMonster = type.includes('Monster');
+    const isSpell = type.includes('Spell');
+    const isTrap = type.includes('Trap');
     const isExtraDeck = /Fusion|Synchro|XYZ|Xyz|Link/.test(type);
+    const GY = '(?:gy|graveyard)';
+    const any = (patterns) => patterns.some(re => re.test(desc));
 
     // Extra Deck monsters are never drawn into an opening hand — the
     // starter/extender/brick concept (which is about hand quality) doesn't
@@ -1440,14 +1502,12 @@ function classifyCardRole(card) {
         return { role: 'other', reason: 'Extra Deck monster — not part of opening-hand odds.' };
     }
 
-    // Known hand traps and hand-trap-style staple disruption (see HAND_TRAPS
-    // comment) — its own bucket, distinct from "Other", since it's a
-    // well-defined disruption role rather than a catch-all.
+    // Known hand traps and hand-trap-style staple disruption (see HAND_TRAPS).
     if (HAND_TRAPS.includes(card.name)) {
         return { role: 'handtrap', reason: 'Disruption/negation staple — not a combo piece.' };
     }
 
-    // ── Brick checks ────────────────────────────────────────────────────────
+    // ── Brick ────────────────────────────────────────────────────────────
     if (isMonster && type.includes('Normal') && !type.includes('Effect')) {
         return { role: 'brick', reason: 'Vanilla Normal Monster — no effect, dead card alone.' };
     }
@@ -1455,52 +1515,72 @@ function classifyCardRole(card) {
         return { role: 'brick', reason: 'Equip Spell — needs a monster already on board to do anything.' };
     }
 
-    // ── Starter checks ──────────────────────────────────────────────────────
+    // ── Draw engine (Spells/Traps whose main effect is drawing) ───────────
+    if (!isMonster && /\bdraw (?:\d+|one|two|three) cards?\b|\bdraw 1 card\b/.test(desc)
+        && !/\badd \d* ?[^.;]*to your hand|special summon/.test(desc)) {
+        return { role: 'draw', reason: 'Draws cards — thins/refills the hand rather than starting a combo.' };
+    }
+
+    // ── Searcher (adds a card from Deck/GY to hand) ──────────────────────
+    const searchPatterns = [
+        new RegExp(`add (?:1|up to \\d+|2|3) [^.;]*from your deck(?: or ${GY})? to your hand`),
+        new RegExp(`add (?:1|up to \\d+|2|3) [^.;]*from your ${GY} to your hand`),
+    ];
+    if (any(searchPatterns)) {
+        return { role: 'searcher', reason: 'Adds a card from your Deck/GY to your hand — gets you to the engine.' };
+    }
+
+    // ── Starter (self-summons / mills into the engine from hand alone) ────
     const starterPatterns = [
         /special summon this card \(from your hand\)/,
         /you can special summon this card from your hand/,
         /can be special summoned.*from your hand/,
-        /add 1 .*from your deck to your hand/,
-        /add .*from your deck or gy to your hand/,
-        /draw 2 cards/,
         /you can only activate this card if you control no other cards/,
         /if you control no other cards, you can/,
-        /special summon 1 .*from your hand/,
+        /special summon 1 [^.;]*from your hand/,
+        /send (?:1|2) [^.;]*from your deck to the (?:gy|graveyard)/,
     ];
-    if (starterPatterns.some(re => re.test(desc))) {
-        return { role: 'starter', reason: 'Searches, draws, or self-summons — usable from an empty board.' };
+    if (any(starterPatterns)) {
+        return { role: 'starter', reason: 'Self-summons or sets up from the Deck — usable from an empty board.' };
     }
 
-    // ── Extender checks ──────────────────────────────────────────────────────
-    // NOTE: real card text (and ygoprodeck's desc field) abbreviates Graveyard
-    // as "GY", not spelled out — e.g. Dragonmaid Tidying reads "You can banish
-    // this card from your GY; Special Summon...". Every pattern below matches
-    // "gy" (with "graveyard" also tolerated defensively, since some
-    // third-party sources spell it out) — an earlier version of this file
-    // only matched "graveyard", which meant these patterns effectively never
-    // fired against real card text and everything GY-reliant fell into
-    // "Other" instead of "Extender".
-    const GY = '(?:gy|graveyard)';
+    // ── Board breaker (mass/targeted removal, control steal) ─────────────
+    const breakerPatterns = [
+        /(?:destroy|banish|return|send) all /,
+        /take control of/,
+        /(?:destroy|banish) (?:up to )?(?:1|2|3|\d+) [^.;]*(?:your opponent controls|on the field)/,
+        /return (?:1|2|3|\d+) [^.;]*(?:your opponent controls|on the field) to the (?:hand|deck)/,
+    ];
+    if (any(breakerPatterns)) {
+        return { role: 'breaker', reason: 'Removes or takes the opponent\'s board — breaks through a set-up.' };
+    }
+
+    // ── Defensive (Traps / Quick-Play Spells that negate or protect) ─────
+    if ((isTrap || type.includes('Quick-Play')) &&
+        /negate|cannot be destroyed|cannot be targeted|unaffected by/.test(desc)) {
+        return { role: 'defensive', reason: 'Negates or protects at instant speed — interaction, not a combo piece.' };
+    }
+
+    // ── Extender ─────────────────────────────────────────────────────────
+    // NOTE: ygoprodeck's desc field abbreviates Graveyard as "GY"; every
+    // pattern below matches "gy" (and "graveyard" defensively).
     const extenderPatterns = [
         new RegExp(`special summon this card from your (?:hand or )?${GY}`),
         new RegExp(`you can banish this card from your ${GY}`),
         new RegExp(`if this card is (?:sent to the ${GY}|destroyed)`),
         new RegExp(`when this card is (?:sent to the ${GY}|destroyed)`),
         new RegExp(`shuffle this card into the deck.*special summon`),
-        new RegExp(`special summon 1 .*from your ${GY}`),
-        // Self-recursion from the GY back to hand (e.g. Dragonmaid Changeover:
-        // "While this card is in your GY: ... add this card to your hand").
+        new RegExp(`special summon 1 [^.;]*from your ${GY}`),
+        // Self-recursion from the GY back to hand (e.g. Dragonmaid Changeover).
         new RegExp(`add this card to your hand`),
-        // Generic revival spells/traps phrased as "target 1 monster in
-        // (either|your) GY; Special Summon it" (e.g. Monster Reborn) rather
-        // than "Special Summon ... from your GY".
+        // Revival spells/traps (e.g. Monster Reborn).
         new RegExp(`target 1 monster in (?:either|your) ${GY}.*special summon`),
     ];
-    if (extenderPatterns.some(re => re.test(desc))) {
+    if (any(extenderPatterns)) {
         return { role: 'extender', reason: 'Recurs or extends from the Graveyard — picks up after a starter.' };
     }
 
-    return { role: 'other', reason: "Doesn't clearly match Starter/Extender/Brick patterns — generic effect." };
+    return { role: 'other', reason: "Doesn't clearly match any role pattern — generic effect." };
 }
 
 class DeckUI extends Modal {
@@ -1936,11 +2016,13 @@ class DeckUI extends Modal {
     // to have any cards", since a note commonly keeps both checklists
     // populated side by side and that silently locked Test Hand onto the
     // variant even when the user was building/testing the 60-card deck.
-    // Extra Deck and Side Deck are never drawn from.
+    // Extra Deck is never drawn from. The Side Deck is added to the pool only
+    // while this.handIncludeSide is on (default on, toggle in the Test Hand tab).
     buildDrawPool() {
         const mainCards = this.decks[this.lastMainDeckTab] || this.decks.main60;
         const pool = [];
-        for (const c of mainCards) {
+        const sources = this.handIncludeSide !== false ? [...mainCards, ...(this.decks.side || [])] : mainCards;
+        for (const c of sources) {
             const copies = c.count || 1;
             for (let i = 0; i < copies; i++) pool.push(c);
         }
@@ -1959,6 +2041,7 @@ class DeckUI extends Modal {
     renderHandSimulator(container) {
         const pool = this.buildDrawPool();
         const usingVariant = this.lastMainDeckTab === 'main40';
+        const sideOn = this.handIncludeSide !== false;
 
         const controls = container.createEl('div');
         controls.style.cssText = `
@@ -1968,9 +2051,16 @@ class DeckUI extends Modal {
         const info = controls.createEl('span');
         info.style.cssText = 'font-size: 0.75em; color: #6b7280; font-family: monospace; margin-right: auto;';
         info.textContent = pool.length > 0
-            ? `Pool: ${pool.length} cards (${usingVariant ? '40-Card Variant' : 'Main Deck'})`
+            ? `Pool: ${pool.length} cards (${usingVariant ? '40-Card Variant' : 'Main Deck'}${sideOn ? ' + Side Deck' : ''})`
             : 'No main deck cards loaded — load a deck first.';
 
+        const sideBtn = this.makeBtn(controls, (sideOn ? '☑ ' : '☐ ') + 'Include Side Deck', sideOn ? '#facc15' : '#374151', sideOn ? '#0d0f1a' : '#9ca3af');
+        sideBtn.onclick = () => {
+            this.handIncludeSide = !sideOn;
+            this.currentHand = null;
+            container.empty();
+            this.renderHandSimulator(container);
+        };
         const draw5Btn = this.makeBtn(controls, '🎲 Draw 5 · Going First', '#e8c84a', '#0d0f1a');
         const draw6Btn = this.makeBtn(controls, '🎲 Draw 6 · Going Second', '#c084f5', '#fff');
         const redrawBtn = this.makeBtn(controls, '🔄 Redraw', '#60a5fa', '#fff');
@@ -2036,15 +2126,28 @@ class DeckUI extends Modal {
         renderHand();
     }
 
+    // Role for a card: a saved per-deck override (settings.roleOverrides,
+    // keyed by note path → lowercase card name → role) wins; otherwise falls
+    // back to the regex heuristic in classifyCardRole().
+    getCardRole(card) {
+        const file = this.plugin.getActiveFile();
+        const overrides = (this.plugin.settings.roleOverrides || {})[file ? file.path : ''];
+        const key = (card.name || '').toLowerCase();
+        const builtIn = DEFAULT_ROLE_OVERRIDES[file ? file.basename : ''];
+        const role = (overrides && overrides[key]) || (builtIn && builtIn[key]);
+        if (role && ROLE_META[role]) return { role, reason: 'Manual override for this deck.' };
+        return classifyCardRole(card);
+    }
+
     // Simulates `trials` opening hands drawn from `pool` (already copies-
     // weighted by buildDrawPool) without replacement per hand, classifying
-    // each card with the same classifyCardRole() heuristic the Analysis tab
+    // each card with the same getCardRole() (override → classifyCardRole) the Analysis tab
     // uses. A card's role never changes between copies, so it's cached by
     // name to avoid redundantly re-running the regex checks per copy.
     runConsistencyTest(pool, handSize, trials = 10000) {
         const roleCache = new Map();
         const getRole = (card) => {
-            if (!roleCache.has(card.name)) roleCache.set(card.name, classifyCardRole(card).role);
+            if (!roleCache.has(card.name)) roleCache.set(card.name, this.getCardRole(card).role);
             return roleCache.get(card.name);
         };
 
@@ -2056,7 +2159,7 @@ class DeckUI extends Modal {
             let starters = 0, hasExtender = false, hasHandtrap = false, hasNonBrick = false;
             for (const card of hand) {
                 const role = getRole(card);
-                if (role === 'starter') { starters++; hasNonBrick = true; }
+                if (role === 'starter' || role === 'searcher') { starters++; hasNonBrick = true; }
                 else if (role === 'extender') { hasExtender = true; hasNonBrick = true; }
                 else if (role === 'handtrap') { hasHandtrap = true; hasNonBrick = true; }
                 else if (role !== 'brick') { hasNonBrick = true; } // generic "other" staples still count as non-dead
@@ -3283,7 +3386,12 @@ class DeckUI extends Modal {
             return;
         }
 
-        const { content: updated, removed, newCount } = decrementCardInTemplate(content, card.name, group);
+        const { content: updated, removed, newCount, found } = decrementCardInTemplate(content, card.name, group);
+        if (found === false) {
+            this.setStatus(` Couldn't find a line for "${card.name}" in ${group} - nothing removed.`);
+            new Notice(`Couldn't find "${card.name}" in the note's ${group} section.`);
+            return;
+        }
         const success = await this.plugin.writeTemplate(updated);
         if (!success) {
             this.setStatus(`❌ Failed to remove "${card.name}" — no active file found.`);
@@ -3460,7 +3568,7 @@ class DeckUI extends Modal {
     // matching how often you'd actually draw each role — not just unique-card
     // counts. Extra Deck is excluded (see classifyCardRole).
     renderAnalysis(container) {
-        if (!this.analysisDeck) {
+        if (!this.analysisDeck || this.analysisDeck === 'side') {
             this.analysisDeck = this.lastMainDeckTab; // same "last viewed" default as Test Hand/Validate/Craft List, not "the variant, if it happens to be non-empty"
         }
 
@@ -3487,22 +3595,41 @@ class DeckUI extends Modal {
         mkToggle('🟦 Main Deck (60)', 'main60');
         mkToggle('🟢 40-Card Variant', 'main40');
 
+        // Optional: fold the Side Deck's cards into the analysis of whichever
+        // main deck is selected (Main 60 + Side, or 40-Card Variant + Side).
+        const sideBtn = controls.createEl('button');
+        const sideOn = this.analysisIncludeSide !== false;
+        sideBtn.textContent = (sideOn ? '☑ ' : '☐ ') + '🟨 Include Side Deck';
+        sideBtn.style.cssText = `
+            background: ${sideOn ? '#facc1522' : '#1f2937'}; color: ${sideOn ? '#facc15' : '#6b7280'};
+            border: 1px solid ${sideOn ? '#facc15' : '#374151'};
+            padding: 6px 13px; border-radius: 6px; cursor: pointer;
+            font-size: 0.8em; font-family: monospace; font-weight: bold;
+        `;
+        sideBtn.onclick = () => {
+            this.analysisIncludeSide = !sideOn;
+            container.empty();
+            this.renderAnalysis(container);
+        };
+
         const note = controls.createEl('span');
         note.textContent = '🔍 Heuristic estimate from card text — not exact, use as a rough guide.';
         note.style.cssText = 'font-size: 0.7em; color: #6b7280; font-family: monospace; margin-left: auto;';
 
-        const cards = this.decks[this.analysisDeck] || [];
-        if (cards.length === 0) {
+        const mainCards = this.decks[this.analysisDeck] || [];
+        const sideCards = sideOn ? (this.decks.side || []).map(c => ({ ...c, _side: true })) : [];
+        const cards = [...mainCards, ...sideCards];
+        if (mainCards.length === 0) {
             const empty = container.createEl('div');
             empty.style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.85em; padding: 30px; text-align: center;';
             empty.textContent = `No cards loaded in ${this.analysisDeck === 'main40' ? 'the 40-Card Variant' : 'Main Deck'} yet.`;
             return;
         }
 
-        const buckets = { starter: [], extender: [], handtrap: [], brick: [], other: [] };
+        const buckets = Object.fromEntries(Object.keys(ROLE_META).map(r => [r, []]));
         let totalCopies = 0;
         for (const card of cards) {
-            const { role, reason } = classifyCardRole(card);
+            const { role, reason } = this.getCardRole(card);
             const copies = card.count || 1;
             totalCopies += copies;
             buckets[role].push({ card, copies, reason });
@@ -3514,7 +3641,7 @@ class DeckUI extends Modal {
         // ── Percentage bars ──────────────────────────────────────────────────
         const barsWrap = container.createEl('div');
         barsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;';
-        for (const role of ['starter', 'extender', 'handtrap', 'brick', 'other']) {
+        for (const role of Object.keys(ROLE_META)) {
             const items = buckets[role];
             const copies = items.reduce((n, i) => n + i.copies, 0);
             const pct = totalCopies > 0 ? Math.round((copies / totalCopies) * 100) : 0;
@@ -3533,7 +3660,7 @@ class DeckUI extends Modal {
         }
 
         // ── Per-card breakdown ───────────────────────────────────────────────
-        for (const role of ['starter', 'extender', 'handtrap', 'brick', 'other']) {
+        for (const role of Object.keys(ROLE_META)) {
             const items = buckets[role];
             if (items.length === 0) continue;
             const meta = ROLE_META[role];
@@ -3553,11 +3680,37 @@ class DeckUI extends Modal {
                 line.style.cssText = 'display: flex; justify-content: space-between; gap: 10px; padding: 4px 2px; font-family: monospace; font-size: 0.78em;';
                 const nameSpan = line.createEl('span');
                 nameSpan.style.cssText = 'color: #e2e8f0; white-space: nowrap;';
-                nameSpan.textContent = `${card.name} ×${copies}`;
+                nameSpan.textContent = `${card.name} ×${copies}${card._side ? ' (side)' : ''}`;
                 nameSpan.title = reason;
                 const reasonSpan = line.createEl('span');
-                reasonSpan.style.cssText = 'color: #6b7280; text-align: right; max-width: 55%;';
+                reasonSpan.style.cssText = 'color: #6b7280; text-align: right; flex: 1; min-width: 0;';
                 reasonSpan.textContent = reason;
+
+                // Per-deck role override (saved in settings.roleOverrides by note path).
+                const sel = line.createEl('select');
+                sel.style.cssText = 'background: #1f2937; color: #e2e8f0; border: 1px solid #374151; border-radius: 4px; font-family: monospace; font-size: 0.95em; padding: 1px 4px;';
+                const autoOpt = sel.createEl('option', { text: 'Auto' });
+                autoOpt.value = '';
+                for (const r of Object.keys(ROLE_META)) {
+                    const o = sel.createEl('option', { text: ROLE_META[r].label });
+                    o.value = r;
+                }
+                const noteFile = this.plugin.getActiveFile();
+                const notePath = noteFile ? noteFile.path : '';
+                const key = (card.name || '').toLowerCase();
+                const current = ((this.plugin.settings.roleOverrides || {})[notePath] || {})[key] || '';
+                sel.value = ROLE_META[current] ? current : '';
+                if (sel.value) sel.style.borderColor = ROLE_META[sel.value].color;
+                sel.onchange = async () => {
+                    if (!notePath) { new Notice('Open your checklist note first.'); return; }
+                    const all = this.plugin.settings.roleOverrides = this.plugin.settings.roleOverrides || {};
+                    const deckMap = all[notePath] = all[notePath] || {};
+                    if (sel.value) deckMap[key] = sel.value; else delete deckMap[key];
+                    if (Object.keys(deckMap).length === 0) delete all[notePath];
+                    await this.plugin.saveSettings();
+                    container.empty();
+                    this.renderAnalysis(container);
+                };
             }
         }
     }

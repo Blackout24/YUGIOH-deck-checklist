@@ -1,3 +1,10 @@
 {
-  "templatePath": "Templates/Master duel checklist.md"
+  "templatePath": "Templates/Master duel checklist.md",
+
+  "roleOverrides": {
+  "Yu-Gi-Oh deck checklists/Dragonmaid Deck.md": {
+    "dragonmaid changeover": "starter"
+  }
 }
+}
+
