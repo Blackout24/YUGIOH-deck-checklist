@@ -3567,8 +3567,34 @@ class DeckUI extends Modal {
                 nameSpan.textContent = `${card.name} ×${copies}`;
                 nameSpan.title = reason;
                 const reasonSpan = line.createEl('span');
-                reasonSpan.style.cssText = 'color: #6b7280; text-align: right; max-width: 55%;';
+                reasonSpan.style.cssText = 'color: #6b7280; text-align: right; flex: 1; min-width: 0;';
                 reasonSpan.textContent = reason;
+
+                // Per-deck role override (saved in settings.roleOverrides by note path).
+                const sel = line.createEl('select');
+                sel.style.cssText = 'background: #1f2937; color: #e2e8f0; border: 1px solid #374151; border-radius: 4px; font-family: monospace; font-size: 0.95em; padding: 1px 4px;';
+                const autoOpt = sel.createEl('option', { text: 'Auto' });
+                autoOpt.value = '';
+                for (const r of Object.keys(ROLE_META)) {
+                    const o = sel.createEl('option', { text: ROLE_META[r].label });
+                    o.value = r;
+                }
+                const noteFile = this.plugin.getActiveFile();
+                const notePath = noteFile ? noteFile.path : '';
+                const key = (card.name || '').toLowerCase();
+                const current = ((this.plugin.settings.roleOverrides || {})[notePath] || {})[key] || '';
+                sel.value = ROLE_META[current] ? current : '';
+                if (sel.value) sel.style.borderColor = ROLE_META[sel.value].color;
+                sel.onchange = async () => {
+                    if (!notePath) { new Notice('Open your checklist note first.'); return; }
+                    const all = this.plugin.settings.roleOverrides = this.plugin.settings.roleOverrides || {};
+                    const deckMap = all[notePath] = all[notePath] || {};
+                    if (sel.value) deckMap[key] = sel.value; else delete deckMap[key];
+                    if (Object.keys(deckMap).length === 0) delete all[notePath];
+                    await this.plugin.saveSettings();
+                    container.empty();
+                    this.renderAnalysis(container);
+                };
             }
         }
     }
