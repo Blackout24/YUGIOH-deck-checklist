@@ -1422,7 +1422,14 @@ const RARITY_LABEL = { UR: '◆ UR', SR: '◇ SR', R: '● R', N: '○ N' };
 const ROLE_META = {
     starter: { label: '🟢 Starter', color: '#4ade80' },
     extender: { label: '🔵 Extender', color: '#60a5fa' },
+    // Manual-only roles: classifyCardRole() never assigns these, they come from
+    // per-deck overrides. Simulator: searcher counts as a starter; the rest
+    // count as non-brick generic cards.
+    searcher: { label: '🔎 Searcher', color: '#2dd4bf' },
+    draw: { label: '📚 Draw Engine', color: '#a78bfa' },
     handtrap: { label: '🪤 Hand Trap', color: '#f87171' },
+    breaker: { label: '💥 Board Breaker', color: '#fb923c' },
+    defensive: { label: '🛡️ Defensive', color: '#facc15' },
     brick: { label: '🟤 Brick', color: '#a8a29e' },
     other: { label: '⚪ Other', color: '#94a3b8' },
 };
@@ -2067,7 +2074,7 @@ class DeckUI extends Modal {
             let starters = 0, hasExtender = false, hasHandtrap = false, hasNonBrick = false;
             for (const card of hand) {
                 const role = getRole(card);
-                if (role === 'starter') { starters++; hasNonBrick = true; }
+                if (role === 'starter' || role === 'searcher') { starters++; hasNonBrick = true; }
                 else if (role === 'extender') { hasExtender = true; hasNonBrick = true; }
                 else if (role === 'handtrap') { hasHandtrap = true; hasNonBrick = true; }
                 else if (role !== 'brick') { hasNonBrick = true; } // generic "other" staples still count as non-dead
@@ -3510,7 +3517,7 @@ class DeckUI extends Modal {
             return;
         }
 
-        const buckets = { starter: [], extender: [], handtrap: [], brick: [], other: [] };
+        const buckets = Object.fromEntries(Object.keys(ROLE_META).map(r => [r, []]));
         let totalCopies = 0;
         for (const card of cards) {
             const { role, reason } = this.getCardRole(card);
@@ -3525,7 +3532,7 @@ class DeckUI extends Modal {
         // ── Percentage bars ──────────────────────────────────────────────────
         const barsWrap = container.createEl('div');
         barsWrap.style.cssText = 'display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px;';
-        for (const role of ['starter', 'extender', 'handtrap', 'brick', 'other']) {
+        for (const role of Object.keys(ROLE_META)) {
             const items = buckets[role];
             const copies = items.reduce((n, i) => n + i.copies, 0);
             const pct = totalCopies > 0 ? Math.round((copies / totalCopies) * 100) : 0;
@@ -3544,7 +3551,7 @@ class DeckUI extends Modal {
         }
 
         // ── Per-card breakdown ───────────────────────────────────────────────
-        for (const role of ['starter', 'extender', 'handtrap', 'brick', 'other']) {
+        for (const role of Object.keys(ROLE_META)) {
             const items = buckets[role];
             if (items.length === 0) continue;
             const meta = ROLE_META[role];
