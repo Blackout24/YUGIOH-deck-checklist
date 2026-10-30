@@ -1,4 +1,4 @@
-﻿const { App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile } = require('obsidian');
+﻿const { App, Plugin, PluginSettingTab, Setting, Notice, Modal, TFile, requestUrl } = require('obsidian');
 
 const HAND_TRAPS = [
     'Ash Blossom & Joyous Spring', 'Maxx "C"', 'Effect Veiler',
@@ -56,7 +56,7 @@ const BANLIST_SOURCE_URL = 'https://dawnbrandbots.github.io/yaml-yugi-limit-regu
 // offline stretch doesn't go unnoticed.
 const BANLIST_STALE_DAYS = 30;
 
-const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {}, autoSnapshots: true };
+const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {}, autoSnapshots: true, metaDecksFolder: '', cardKindCache: {} };
 
 // ── Shared line/section helpers ──────────────────────────────────────────────
 // Recognizes both checkbox styles: "- [ ]"/"- [x]" and "- ☐"/"- ☑".
@@ -958,6 +958,177 @@ function formatStamp(d, withSeconds) {
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}${withSeconds ? '' : ':'}${p(d.getMinutes())}${withSeconds ? p(d.getSeconds()) : ''}`;
 }
 
+// ── Meta Deck Research Center ─────────────────────────────────────────────
+// Reference decks are plain markdown notes in "<Meta Decks folder>/<name>.md"
+// (frontmatter: source, import date, revision, tags + MAIN/EXTRA/SIDE sections
+// the existing parser understands). Re-importing a name archives the old
+// revision under "History/<name>/" with a changelog. Nothing is fetched unless
+// you click Import — there is no background network activity.
+const META_REF_TAGS = ['meta', 'ranked', 'budget', 'tournament', 'experimental'];
+const META_ZONE_HEADINGS = { main: '# 🟦 MAIN DECK', extra: '# 🟥 EXTRA DECK', side: '# 🟨 SIDE DECK' };
+
+function kindOfType(type) {
+    const t = String(type || '');
+    if (t.includes('Spell')) return 's';
+    if (t.includes('Trap')) return 't';
+    return 'm';
+}
+function isExtraDeckType(type) { return /Fusion|Synchro|XYZ|Xyz|Link/.test(String(type || '')); }
+
+function decodeYdkeSegment(seg) {
+    if (!seg) return [];
+    const bin = atob(seg.replace(/-/g, '+').replace(/_/g, '/'));
+    const bytes = Uint8Array.from(bin, ch => ch.charCodeAt(0));
+    const ids = [];
+    for (let i = 0; i + 3 < bytes.length; i += 4) {
+        ids.push((bytes[i] | (bytes[i + 1] << 8) | (bytes[i + 2] << 16) | (bytes[i + 3] << 24)) >>> 0);
+    }
+    return ids;
+}
+
+function addCount(list, name, count) {
+    const key = canonicalCardName(name);
+    const hit = list.find(e => canonicalCardName(e.name) === key);
+    if (hit) hit.count += count; else list.push({ name, count });
+}
+
+// Accepts a ydke:// URL, a .ydk file's text, or a plain-text list
+// ("3x Name", "Name x3", "Name ×3", "3 Name", bare names; optional
+// Main/Extra/Side/Monsters/Spells/Traps headings).
+// Returns { ids: {main,extra,side} } for id-based formats, or { zones } for names.
+function parseDeckListText(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return null;
+
+    const y = text.match(/ydke:\/\/([A-Za-z0-9+\/_=-]*)!([A-Za-z0-9+\/_=-]*)!([A-Za-z0-9+\/_=-]*)!?/);
+    if (y) return { ids: { main: decodeYdkeSegment(y[1]), extra: decodeYdkeSegment(y[2]), side: decodeYdkeSegment(y[3]) } };
+
+    if (/^\s*#main\b/im.test(text) || /^\s*#extra\b/im.test(text)) {
+        const ids = { main: [], extra: [], side: [] };
+        let zone = 'main';
+        for (const line of text.split(/\r?\n/)) {
+            const l = line.trim();
+            if (/^#main\b/i.test(l)) zone = 'main';
+            else if (/^#extra\b/i.test(l)) zone = 'extra';
+            else if (/^!side\b/i.test(l)) zone = 'side';
+            else if (/^\d+$/.test(l)) ids[zone].push(parseInt(l, 10));
+        }
+        return { ids };
+    }
+
+    const zones = { main: [], extra: [], side: [] };
+    let zone = 'main';
+    const headingRe = /^(?:#+\s*)?(main deck|main|extra deck|extra|side deck|side|monsters?|spells?|traps?)\b\s*(?:\(\s*\d+\s*\)|[:\-]?\s*\d*)?\s*:?\s*$/i;
+    const skipRe = /^(total|deck name|name|created|author|by|format|source|date|tags?)\b\s*:/i;
+    for (const line of text.split(/\r?\n/)) {
+        let l = line.trim().replace(/^[-*•]\s*(\[[ xX]\]\s*)?/, '').trim();
+        if (!l || /:\/\//.test(l) || skipRe.test(l)) continue;
+        const h = l.match(headingRe);
+        if (h) { const k = h[1].toLowerCase(); zone = k.startsWith('extra') ? 'extra' : k.startsWith('side') ? 'side' : 'main'; continue; }
+        l = l.replace(/\s*\[[A-Z]{1,3}\]\s*$/, '').replace(/\s*\([A-Z0-9]{2,6}-[A-Z]{0,3}\d{2,4}\)\s*$/, '').trim();
+        let m = l.match(/^(\d+)\s*[xX×]?\s+(.+)$/);
+        if (m) { addCount(zones[zone], m[2].trim(), parseInt(m[1], 10)); continue; }
+        m = l.match(/^(.+?)\s*[xX×]\s*(\d+)$/);
+        if (m) { addCount(zones[zone], m[1].trim(), parseInt(m[2], 10)); continue; }
+        if (/[A-Za-z]/.test(l) && l.length >= 2) addCount(zones[zone], l, 1);
+    }
+    const total = zones.main.length + zones.extra.length + zones.side.length;
+    return total ? { zones } : null;
+}
+
+function buildRefText(meta, zones) {
+    const out = [
+        '---',
+        'yugioh-reference: true',
+        `name: ${JSON.stringify(meta.name || '')}`,
+        `source: ${JSON.stringify(meta.source || '')}`,
+        `imported: ${meta.imported}`,
+        `checked: ${meta.checked || meta.imported}`,
+        `revision: ${meta.revision || 1}`,
+        `tags: [${(meta.tags || []).join(', ')}]`,
+        '---',
+        '',
+    ];
+    for (const z of ['main', 'extra', 'side']) {
+        out.push(META_ZONE_HEADINGS[z]);
+        for (const e of zones[z] || []) out.push(`- ${e.name} ×${e.count}`);
+        out.push('');
+    }
+    return out.join('\n');
+}
+
+// → { meta, body } or null when the text isn't a reference note.
+function parseRefText(text) {
+    const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+    if (!fm || !/yugioh-reference:\s*true/.test(fm[1])) return null;
+    const meta = { name: '', source: '', imported: '', checked: '', revision: 1, tags: [] };
+    for (const line of fm[1].split(/\r?\n/)) {
+        const m = line.match(/^([\w-]+):\s*(.*)$/);
+        if (!m) continue;
+        const k = m[1], v = m[2];
+        if (k === 'name' || k === 'source') { try { meta[k] = JSON.parse(v); } catch (_) { meta[k] = v; } }
+        else if (k === 'imported' || k === 'checked') meta[k] = v.trim();
+        else if (k === 'revision') meta.revision = parseInt(v, 10) || 1;
+        else if (k === 'tags') { const t = v.match(/\[(.*)\]/); meta.tags = t ? t[1].split(',').map(x => x.trim()).filter(Boolean) : []; }
+    }
+    return { meta, body: text.slice(fm[0].length) };
+}
+
+// Parsed reference/deck note → { main, extra, side } entry lists ([{name,count}]).
+function zonesFromContent(content) {
+    const zones = { main: [], extra: [], side: [] };
+    for (const e of parseCardsFromMarkdown(content || '')) {
+        const z = e.deckGroup === 'extra' ? 'extra' : e.deckGroup === 'side' ? 'side' : 'main';
+        addCount(zones[z], e.name, e.count || 1);
+    }
+    return zones;
+}
+
+// yours / ref: { main, extra, side } of [{name,count}] → per-card rows + per-zone overlap.
+function compareZones(yours, ref) {
+    const rows = [], summary = {};
+    const order = { diff: 0, 'ref-only': 1, 'yours-only': 2, same: 3 };
+    for (const zone of ['main', 'extra', 'side']) {
+        const A = new Map(), B = new Map();
+        for (const e of yours[zone] || []) A.set(canonicalCardName(e.name), { name: e.name, count: (A.get(canonicalCardName(e.name))?.count || 0) + e.count });
+        for (const e of ref[zone] || []) B.set(canonicalCardName(e.name), { name: e.name, count: (B.get(canonicalCardName(e.name))?.count || 0) + e.count });
+        let shared = 0, totalY = 0, totalR = 0;
+        for (const v of A.values()) totalY += v.count;
+        for (const v of B.values()) totalR += v.count;
+        for (const key of new Set([...A.keys(), ...B.keys()])) {
+            const a = A.get(key), b = B.get(key);
+            const yc = a ? a.count : 0, rc = b ? b.count : 0;
+            shared += Math.min(yc, rc);
+            rows.push({ zone, name: (a || b).name, yours: yc, ref: rc,
+                status: !yc ? 'ref-only' : !rc ? 'yours-only' : yc === rc ? 'same' : 'diff' });
+        }
+        summary[zone] = { shared, totalY, totalR };
+    }
+    const zo = { main: 0, extra: 1, side: 2 };
+    rows.sort((x, y) => zo[x.zone] - zo[y.zone] || order[x.status] - order[y.status] || x.name.localeCompare(y.name));
+    return { rows, summary };
+}
+
+// Shared table renderer for card-count diffs (rows from diffDeckContents()).
+function renderDiffTable(parent, rows, aLabel, bLabel) {
+    const table = parent.createEl('div');
+    table.style.cssText = 'display: grid; grid-template-columns: 1fr 90px 90px; gap: 2px 10px; font-family: monospace; font-size: 0.78em; max-height: 280px; overflow-y: auto;';
+    const th = (t) => { const c = table.createEl('div', { text: t }); c.style.cssText = 'color: #6b7280; font-weight: bold; padding-bottom: 4px; border-bottom: 1px solid #1f2937; position: sticky; top: 0; background: #0b1220;'; };
+    th('Card'); th(String(aLabel).slice(0, 12)); th(String(bLabel).slice(0, 12));
+    const COLORS = { added: '#4ade80', removed: '#f87171', changed: '#facc15' };
+    let last = null;
+    for (const r of rows) {
+        if (r.group !== last) {
+            last = r.group;
+            const g = table.createEl('div', { text: DECK_GROUP_LABEL[r.group] || r.group });
+            g.style.cssText = 'grid-column: 1 / -1; color: #a5b4fc; font-weight: bold; margin-top: 6px;';
+        }
+        table.createEl('div', { text: `${r.status === 'added' ? '+' : r.status === 'removed' ? '−' : '~'} ${r.name}` }).style.cssText = `color: ${COLORS[r.status]};`;
+        table.createEl('div', { text: r.aCount ? `×${r.aCount}` : '—' }).style.cssText = `color: ${r.aCount ? '#e2e8f0' : '#4b5563'};`;
+        table.createEl('div', { text: r.bCount ? `×${r.bCount}` : '—' }).style.cssText = `color: ${r.bCount ? '#e2e8f0' : '#4b5563'};`;
+    }
+}
+
 class YugiohPlugin extends Plugin {
     async onload() {
         await this.loadSettings();
@@ -1363,6 +1534,160 @@ class YugiohPlugin extends Plugin {
         await this.appendChangelog(file, {
             name: `Restored "${snap.meta.name}"`, created: new Date().toISOString(), auto: false, tags: [], reason: '',
         }, 'restore');
+    }
+
+    // ── Meta Deck Research Center ────────────────────────────────────────
+    getMetaFolder() {
+        const custom = (this.settings.metaDecksFolder || '').trim().replace(/\/+$/, '');
+        if (custom) return custom;
+        const col = this.settings.collectionNotePath || '';
+        const i = col.lastIndexOf('/');
+        return i > 0 ? `${col.slice(0, i)}/Meta Decks` : 'Meta Decks';
+    }
+
+    cacheCardKind(name, type) {
+        const cache = this.settings.cardKindCache = this.settings.cardKindCache || {};
+        cache[canonicalCardName(name)] = kindOfType(type);
+    }
+
+    getCachedKind(name) {
+        return (this.settings.cardKindCache || {})[canonicalCardName(name)] || null;
+    }
+
+    // Plain GET that bypasses browser CORS (only used when the user clicks Import with a URL).
+    async fetchDeckSource(url) {
+        const res = await requestUrl({ url, method: 'GET', throw: false });
+        if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
+        return res.text;
+    }
+
+    // Konami passcodes → Map(id → { name, type }) via the YGOPRODeck API (batched).
+    async resolveIds(ids) {
+        const out = new Map();
+        const unique = [...new Set(ids)];
+        for (let i = 0; i < unique.length; i += 40) {
+            const chunk = unique.slice(i, i + 40);
+            try {
+                const res = await fetch(`https://db.ygoprodeck.com/api/v7/cardinfo.php?id=${chunk.join(',')}`);
+                if (!res.ok) continue;
+                const data = await res.json();
+                for (const c of data.data || []) {
+                    out.set(c.id, { name: c.name, type: c.type });
+                    for (const img of c.card_images || []) out.set(img.id, { name: c.name, type: c.type });
+                }
+            } catch (err) { console.error('[YugiohPlugin] resolveIds error:', err); }
+        }
+        return out;
+    }
+
+    // Names → Map(lowercase input → { name, type } | null), 4 lookups at a time.
+    async resolveNames(names, onProgress) {
+        const out = new Map();
+        const queue = [...new Set(names)];
+        let done = 0;
+        const worker = async () => {
+            while (queue.length) {
+                const n = queue.shift();
+                const c = await this.fetchCard(n);
+                out.set(n.toLowerCase(), c ? { name: c.name, type: c.type } : null);
+                done++;
+                if (onProgress) onProgress(done, done + queue.length);
+            }
+        };
+        await Promise.all([worker(), worker(), worker(), worker()]);
+        return out;
+    }
+
+    async listReferences() {
+        const folder = this.app.vault.getAbstractFileByPath(this.getMetaFolder());
+        const out = [];
+        if (!folder || !folder.children) return out;
+        for (const child of folder.children) {
+            if (!(child instanceof TFile) || child.extension !== 'md') continue;
+            const parsed = parseRefText(await this.app.vault.read(child));
+            if (parsed) out.push({ file: child, meta: parsed.meta, body: parsed.body, zones: zonesFromContent(parsed.body) });
+        }
+        out.sort((a, b) => (b.meta.checked || '').localeCompare(a.meta.checked || ''));
+        return out;
+    }
+
+    getRefHistoryFolder(name) {
+        const safe = name.replace(/[\\/:*?"<>|#^\[\]]/g, '-').slice(0, 80);
+        return `${this.getMetaFolder()}/History/${safe}`;
+    }
+
+    // Past revisions of a reference, newest first: [{ file, meta, body }].
+    async listRefRevisions(name) {
+        const folder = this.app.vault.getAbstractFileByPath(this.getRefHistoryFolder(name));
+        const out = [];
+        if (!folder || !folder.children) return out;
+        for (const child of folder.children) {
+            if (!(child instanceof TFile) || child.extension !== 'md') continue;
+            const parsed = parseRefText(await this.app.vault.read(child));
+            if (parsed) out.push({ file: child, meta: parsed.meta, body: parsed.body });
+        }
+        out.sort((a, b) => (b.meta.revision || 0) - (a.meta.revision || 0));
+        return out;
+    }
+
+    async appendRefChangelog(name, line) {
+        const vault = this.app.vault;
+        const folder = this.getRefHistoryFolder(name);
+        await this.ensureFolder(folder);
+        const path = `${folder}/Changelog.md`;
+        const existing = vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) {
+            const cur = await vault.read(existing);
+            await vault.modify(existing, cur.replace(/\s*$/, '\n') + line + '\n');
+        } else {
+            await vault.create(path, `# Changelog — ${name}\n\nOldest first. Superseded revisions are saved in this folder.\n\n${line}\n`);
+        }
+    }
+
+    // Creates a reference, or — if the name already exists — records a new
+    // revision (old one archived, diff logged) or just notes "unchanged".
+    async saveReference({ name, source, tags, zones }) {
+        const vault = this.app.vault;
+        const folder = this.getMetaFolder();
+        await this.ensureFolder(folder);
+        const safe = name.replace(/[\\/:*?"<>|#^\[\]]/g, '-').slice(0, 80);
+        const path = `${folder}/${safe}.md`;
+        const existing = vault.getAbstractFileByPath(path);
+        const nowIso = new Date().toISOString();
+        const when = formatStamp(new Date(nowIso), false);
+        const cleanTags = [...new Set((tags || []).map(cleanSnapshotTag).filter(Boolean))];
+
+        if (!(existing instanceof TFile)) {
+            const meta = { name, source, imported: nowIso, checked: nowIso, revision: 1, tags: cleanTags };
+            const file = await vault.create(path, buildRefText(meta, zones));
+            await this.appendRefChangelog(name, `- ${when} — rev 1 · imported from ${source || 'pasted text'}`);
+            return { file, revision: 1, status: 'created', summary: 'first import' };
+        }
+
+        const oldText = await vault.read(existing);
+        const old = parseRefText(oldText);
+        const oldMeta = old ? old.meta : { revision: 1, tags: [], imported: nowIso };
+        const probeMeta = { name, source, imported: nowIso, checked: nowIso, revision: oldMeta.revision + 1, tags: cleanTags.length ? cleanTags : oldMeta.tags };
+        const newText = buildRefText(probeMeta, zones);
+        const newBody = parseRefText(newText).body;
+        const rows = diffDeckContents(old ? old.body : '', newBody);
+
+        if (rows.length === 0) {
+            const meta = { ...probeMeta, revision: oldMeta.revision, imported: oldMeta.imported || nowIso };
+            await vault.modify(existing, buildRefText(meta, zones));
+            await this.appendRefChangelog(name, `- ${when} — rev ${oldMeta.revision} · checked ${source || 'pasted text'} — unchanged`);
+            return { file: existing, revision: oldMeta.revision, status: 'unchanged', summary: 'no card changes' };
+        }
+
+        const hist = this.getRefHistoryFolder(name);
+        await this.ensureFolder(hist);
+        let hp = `${hist}/${formatStamp(new Date(oldMeta.imported || nowIso), true)} - rev ${oldMeta.revision}.md`;
+        for (let n = 2; vault.getAbstractFileByPath(hp); n++) hp = hp.replace(/(?: \(\d+\))?\.md$/, ` (${n}).md`);
+        await vault.create(hp, oldText);
+        await vault.modify(existing, newText);
+        const summary = summarizeDiff(rows);
+        await this.appendRefChangelog(name, `- ${when} — rev ${probeMeta.revision} · ${source || 'pasted text'} · ${summary}`);
+        return { file: existing, revision: probeMeta.revision, status: 'updated', summary };
     }
 
     async createDeckTemplate() {
@@ -1876,6 +2201,8 @@ class DeckUI extends Modal {
         craftBtn.title = 'What you still need to craft, based on your Collection note';
         const versionsBtn = this.makeBtn(searchRow, '🗂️ Versions', '#312e81', '#c7d2fe');
         versionsBtn.title = 'Save, compare and restore named versions of this deck note';
+        const researchBtn = this.makeBtn(searchRow, '🌐 Meta Research', '#0c4a6e', '#bae6fd');
+        researchBtn.title = 'Import public deck lists and compare them with your deck';
         const applyTplBtn = this.makeBtn(searchRow, '🗋 Apply Template', '#1f2937', '#f87171');
         applyTplBtn.title = 'Overwrite the current note with the blank deck template';
 
@@ -1977,6 +2304,7 @@ class DeckUI extends Modal {
         validateBtn.onclick = () => this.showValidation();
         craftBtn.onclick = () => this.showCraftList();
         versionsBtn.onclick = () => this.openVersions();
+        researchBtn.onclick = () => new ResearchUI(this.app, this.plugin, this).open();
         applyTplBtn.onclick = () => this.confirmApplyTemplate();
 
         // Auto-load on open
@@ -4406,6 +4734,377 @@ class VersionsUI extends Modal {
     }
 }
 
+// Meta Deck Research Center window: import public deck lists (paste a list,
+// .ydk text, ydke:// link, or a URL that serves one), keep them as dated
+// reference notes, compare them with the deck open in the builder, and track
+// changes between revisions of the same reference.
+class ResearchUI extends Modal {
+    constructor(app, plugin, deckUI) {
+        super(app);
+        this.plugin = plugin;
+        this.deckUI = deckUI;
+        this.refs = [];
+        this.form = { name: '', source: '', text: '', tags: new Set() };
+        this.status = '';
+        this.busy = false;
+        this.compare = null;  // { path, filter }
+        this.history = null;  // { path, revIdx }
+    }
+
+    async onOpen() {
+        this.modalEl.style.width = '900px';
+        this.modalEl.style.maxWidth = '95vw';
+        this.modalEl.style.maxHeight = '92vh';
+        const { contentEl } = this;
+        contentEl.style.cssText = `
+            background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif;
+            padding: 0; display: flex; flex-direction: column; height: 82vh;
+        `;
+        const header = contentEl.createEl('div');
+        header.style.cssText = `
+            background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%);
+            padding: 16px 24px 12px; border-bottom: 2px solid #38bdf844; flex-shrink: 0;
+        `;
+        const title = header.createEl('h1');
+        title.textContent = '🌐 Meta Deck Research';
+        title.style.cssText = `
+            margin: 0 0 3px; font-size: 1.35em; font-weight: bold;
+            background: linear-gradient(90deg, #38bdf8, #a5b4fc);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+        `;
+        const sub = header.createEl('p');
+        sub.style.cssText = 'margin: 0; font-size: 0.72em; color: #94a3b8; font-family: monospace;';
+        sub.textContent = `Optional & manual — nothing is fetched until you click Import.  •  References: ${this.plugin.getMetaFolder()}/`;
+
+        this.body = contentEl.createEl('div');
+        this.body.style.cssText = 'padding: 14px 22px 20px; overflow-y: auto; flex: 1;';
+        await this.reload();
+    }
+
+    async reload() {
+        this.refs = await this.plugin.listReferences();
+        await this.render();
+    }
+
+    mkBtn(parent, label, bg, color, title) {
+        const b = parent.createEl('button');
+        b.textContent = label;
+        if (title) b.title = title;
+        b.style.cssText = `background: ${bg}; color: ${color}; border: 1px solid ${color}55; padding: 5px 11px; border-radius: 6px; cursor: pointer; font-size: 0.78em; font-family: monospace; font-weight: bold;`;
+        return b;
+    }
+
+    mkChip(parent, text, color) {
+        const c = parent.createEl('span');
+        c.textContent = text;
+        c.style.cssText = `font-size: 0.68em; font-family: monospace; padding: 1px 7px; border-radius: 10px; color: ${color}; border: 1px solid ${color}66; background: ${color}18;`;
+        return c;
+    }
+
+    setStatus(msg) { this.status = msg; if (this.statusEl) this.statusEl.textContent = msg; }
+
+    // ── Import ───────────────────────────────────────────────────────────
+    async doImport() {
+        const f = this.form;
+        const name = f.name.trim();
+        if (!name) { new Notice('Give the reference a name first.'); return; }
+        this.busy = true;
+        try {
+            let text = f.text.trim();
+            const source = f.source.trim();
+            if (!text) {
+                if (!/^https?:\/\//i.test(source)) { new Notice('Paste a deck list, or put a URL in Source.'); this.busy = false; return; }
+                this.setStatus('Fetching…');
+                text = await this.plugin.fetchDeckSource(source);
+            } else if (/^https?:\/\/\S+$/i.test(text)) {
+                this.setStatus('Fetching…');
+                text = await this.plugin.fetchDeckSource(text);
+            }
+            const parsed = parseDeckListText(text);
+            if (!parsed) {
+                throw new Error(/<html|<!doctype/i.test(text)
+                    ? "That page doesn't expose a readable deck list (many deck sites build it with JavaScript). Paste the list, or its .ydk / ydke:// export, instead."
+                    : 'Could not find any cards in that text.');
+            }
+
+            let zones = { main: [], extra: [], side: [] };
+            const types = new Map(); // canonical name → type
+            if (parsed.ids) {
+                const allIds = [...parsed.ids.main, ...parsed.ids.extra, ...parsed.ids.side];
+                this.setStatus(`Looking up ${new Set(allIds).size} cards…`);
+                const map = await this.plugin.resolveIds(allIds);
+                let missing = 0;
+                for (const z of ['main', 'extra', 'side']) {
+                    for (const id of parsed.ids[z]) {
+                        const c = map.get(id);
+                        if (!c) { missing++; addCount(zones[z], `Unknown card #${id}`, 1); continue; }
+                        addCount(zones[z], c.name, 1);
+                        types.set(canonicalCardName(c.name), c.type);
+                    }
+                }
+                if (missing) new Notice(`${missing} card id(s) could not be resolved.`);
+            } else {
+                const names = [...parsed.zones.main, ...parsed.zones.extra, ...parsed.zones.side].map(e => e.name);
+                const resolved = await this.plugin.resolveNames(names, (d, t) => this.setStatus(`Resolving card names… ${d}/${t}`));
+                let unresolved = 0;
+                for (const z of ['main', 'extra', 'side']) {
+                    for (const e of parsed.zones[z]) {
+                        const r = resolved.get(e.name.toLowerCase());
+                        if (!r) { unresolved++; addCount(zones[z], e.name, e.count); continue; }
+                        types.set(canonicalCardName(r.name), r.type);
+                        // Extra Deck monsters pasted under "Main" belong in the Extra Deck.
+                        const target = (z === 'main' && isExtraDeckType(r.type)) ? 'extra' : z;
+                        addCount(zones[target], r.name, e.count);
+                    }
+                }
+                if (unresolved) new Notice(`${unresolved} name(s) weren't recognised and were kept as typed.`);
+            }
+            for (const [k, type] of types) this.plugin.cacheCardKind(k, type);
+            await this.plugin.saveSettings();
+
+            this.setStatus('Saving…');
+            const res = await this.plugin.saveReference({ name, source, tags: [...f.tags], zones });
+            const msg = { created: 'Saved', updated: `Updated to rev ${res.revision} (${res.summary})`, unchanged: 'Checked — unchanged' }[res.status];
+            new Notice(`🌐 ${msg}: ${name}`);
+            this.form = { name: '', source: '', text: '', tags: new Set() };
+            this.setStatus('');
+            this.busy = false;
+            await this.reload();
+        } catch (err) {
+            console.error('[YugiohPlugin] import failed:', err);
+            this.busy = false;
+            this.setStatus(`⚠️ ${err.message}`);
+            new Notice(`Import failed: ${err.message}`);
+        }
+    }
+
+    // ── Rendering ────────────────────────────────────────────────────────
+    async render() {
+        const body = this.body;
+        body.empty();
+        const inputCss = 'background: #111827; color: #e2e8f0; border: 1px solid #374151; border-radius: 6px; padding: 7px 10px; font-family: monospace; font-size: 0.82em; width: 100%; box-sizing: border-box;';
+
+        // Import form
+        const form = body.createEl('div');
+        form.style.cssText = 'background: #111827; border: 1px solid #1f2937; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 8px;';
+        form.createEl('div', { text: '📥 Import / update a reference list' }).style.cssText = 'font-family: monospace; font-size: 0.8em; font-weight: bold; color: #38bdf8;';
+
+        const nameIn = form.createEl('input');
+        nameIn.placeholder = 'Name, e.g. "Dragonmaid — Oct 2026 ranked"  (same name again = new revision)';
+        nameIn.value = this.form.name; nameIn.style.cssText = inputCss;
+        nameIn.oninput = () => { this.form.name = nameIn.value; };
+
+        const srcIn = form.createEl('input');
+        srcIn.placeholder = 'Source: URL of the list / article / .ydk (also recorded with the import date)';
+        srcIn.value = this.form.source; srcIn.style.cssText = inputCss;
+        srcIn.oninput = () => { this.form.source = srcIn.value; };
+
+        const ta = form.createEl('textarea');
+        ta.placeholder = 'Paste a deck list: "3x Card" lines, .ydk text, or a ydke:// link.\nLeave empty to fetch the Source URL instead.';
+        ta.value = this.form.text; ta.rows = 5; ta.style.cssText = inputCss + ' resize: vertical;';
+        ta.oninput = () => { this.form.text = ta.value; };
+
+        const tagRow = form.createEl('div');
+        tagRow.style.cssText = 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center;';
+        for (const t of [...new Set([...META_REF_TAGS, ...this.form.tags])]) {
+            const on = this.form.tags.has(t);
+            const b = this.mkBtn(tagRow, `#${t}`, on ? '#38bdf833' : '#1f2937', on ? '#38bdf8' : '#6b7280');
+            b.onclick = () => { on ? this.form.tags.delete(t) : this.form.tags.add(t); this.render(); };
+        }
+
+        const actions = form.createEl('div');
+        actions.style.cssText = 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap;';
+        const importBtn = this.mkBtn(actions, '📥 Import & save', '#38bdf8', '#0d0f1a');
+        importBtn.onclick = () => { if (!this.busy) this.doImport(); };
+        this.statusEl = actions.createEl('span', { text: this.status });
+        this.statusEl.style.cssText = 'font-family: monospace; font-size: 0.75em; color: #94a3b8;';
+        if (this.refs.some(r => r.meta.name.trim() === this.form.name.trim()) && this.form.name.trim()) {
+            this.statusEl.textContent = this.status || 'Name exists → saves as a new revision (old one is archived).';
+        }
+
+        if (this.compare) await this.renderCompare(body);
+        if (this.history) await this.renderHistory(body);
+
+        // Reference list
+        body.createEl('div', { text: `${this.refs.length} saved reference${this.refs.length === 1 ? '' : 's'}` })
+            .style.cssText = 'font-family: monospace; font-size: 0.75em; color: #6b7280; margin-bottom: 8px;';
+        const list = body.createEl('div');
+        list.style.cssText = 'display: flex; flex-direction: column; gap: 8px;';
+        for (const ref of this.refs) {
+            const card = list.createEl('div');
+            card.style.cssText = 'background: #111827; border: 1px solid #38bdf855; border-radius: 8px; padding: 10px 14px;';
+            const top = card.createEl('div');
+            top.style.cssText = 'display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;';
+            top.createEl('span', { text: ref.meta.name }).style.cssText = 'font-family: monospace; font-weight: bold; font-size: 0.88em;';
+            this.mkChip(top, `rev ${ref.meta.revision}`, '#a5b4fc');
+            for (const t of ref.meta.tags) this.mkChip(top, `#${t}`, '#38bdf8');
+            const z = ref.zones;
+            const tot = (a) => a.reduce((n, e) => n + e.count, 0);
+            top.createEl('span', { text: `${tot(z.main)} main · ${tot(z.extra)} extra · ${tot(z.side)} side` })
+                .style.cssText = 'font-family: monospace; font-size: 0.7em; color: #6b7280; margin-left: auto;';
+
+            const meta = card.createEl('div');
+            meta.style.cssText = 'font-family: monospace; font-size: 0.7em; color: #94a3b8; margin-top: 4px; word-break: break-all;';
+            const fmt = (iso) => iso ? new Date(iso).toLocaleDateString() : '?';
+            meta.textContent = `Source: ${ref.meta.source || 'pasted text'}  •  imported ${fmt(ref.meta.imported)}  •  last checked ${fmt(ref.meta.checked)}`;
+
+            const row = card.createEl('div');
+            row.style.cssText = 'display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap;';
+            const cmp = this.mkBtn(row, '⚖️ Compare with my deck', '#1f2937', '#60a5fa');
+            cmp.onclick = async () => { this.compare = { path: ref.file.path, filter: 'all' }; this.history = null; await this.render(); this.body.scrollTop = 0; };
+            const upd = this.mkBtn(row, '🔄 Update', '#1f2937', '#4ade80', 'Re-import this list; changes are archived and logged');
+            upd.onclick = () => { this.form = { name: ref.meta.name, source: ref.meta.source, text: '', tags: new Set(ref.meta.tags) }; this.render(); this.body.scrollTop = 0; };
+            const hist = this.mkBtn(row, '📈 History', '#1f2937', '#fbbf24', 'Changes between revisions');
+            hist.onclick = async () => { this.history = { path: ref.file.path, revIdx: 0 }; this.compare = null; await this.render(); this.body.scrollTop = 0; };
+            const open = this.mkBtn(row, '📄 Open', '#1f2937', '#94a3b8');
+            open.onclick = async () => { this.close(); await this.app.workspace.getLeaf(false).openFile(ref.file); };
+        }
+        if (!this.refs.length) {
+            list.createEl('div', { text: 'No references yet. Paste a list above to save your first one.' })
+                .style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.82em; padding: 24px; text-align: center;';
+        }
+    }
+
+    yourZones() {
+        const d = this.deckUI.decks;
+        const mk = (arr) => (arr || []).map(c => ({ name: c.name, count: c.count || 1, type: c.type }));
+        return { main: mk(d[this.deckUI.lastMainDeckTab]), extra: mk(d.extra), side: mk(d.side) };
+    }
+
+    async renderCompare(body) {
+        const ref = this.refs.find(r => r.file.path === this.compare.path);
+        if (!ref) { this.compare = null; return; }
+        const mainLabel = this.deckUI.lastMainDeckTab === 'main40' ? '40-Card Variant' : 'Main Deck';
+        const yours = this.yourZones();
+        const { rows, summary } = compareZones(yours, ref.zones);
+
+        const panel = body.createEl('div');
+        panel.style.cssText = 'background: #0b1220; border: 1px solid #60a5fa66; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;';
+        const head = panel.createEl('div');
+        head.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px; font-family: monospace; font-size: 0.8em;';
+        head.createEl('span', { text: `⚖️ ${mainLabel} + Extra + Side  vs  ${ref.meta.name}` }).style.cssText = 'color: #60a5fa; font-weight: bold;';
+        const close = this.mkBtn(head, '✕ Close', '#1f2937', '#94a3b8');
+        close.style.marginLeft = 'auto';
+        close.onclick = async () => { this.compare = null; await this.render(); };
+
+        // Overlap summary per zone
+        const sum = panel.createEl('div');
+        sum.style.cssText = 'display: flex; gap: 18px; flex-wrap: wrap; font-family: monospace; font-size: 0.78em; margin-bottom: 10px;';
+        for (const [z, label] of [['main', mainLabel], ['extra', 'Extra'], ['side', 'Side']]) {
+            const s = summary[z];
+            const pct = s.totalR ? Math.round(100 * s.shared / s.totalR) : 0;
+            sum.createEl('span', { text: `${label}: ${s.shared}/${s.totalR} reference copies shared (${pct}%) · you run ${s.totalY}` })
+                .style.cssText = `color: ${pct >= 80 ? '#4ade80' : pct >= 50 ? '#facc15' : '#f87171'};`;
+        }
+
+        // Card-type ratios (main zone): Monster / Spell / Trap
+        const status = panel.createEl('div');
+        status.style.cssText = 'font-family: monospace; font-size: 0.72em; color: #94a3b8; margin-bottom: 6px;';
+        const yoursKind = new Map(yours.main.map(c => [canonicalCardName(c.name), kindOfType(c.type)]));
+        const missing = ref.zones.main.filter(e => !this.plugin.getCachedKind(e.name) && !yoursKind.has(canonicalCardName(e.name)));
+        if (missing.length) {
+            status.textContent = `Looking up ${missing.length} card types…`;
+            const got = await this.plugin.resolveNames(missing.map(e => e.name));
+            for (const r of got.values()) if (r) this.plugin.cacheCardKind(r.name, r.type);
+            await this.plugin.saveSettings();
+            status.textContent = '';
+        }
+        const kindCounts = (entries, yoursSide) => {
+            const k = { m: 0, s: 0, t: 0 };
+            for (const e of entries) {
+                const kind = yoursSide ? kindOfType(e.type) : (this.plugin.getCachedKind(e.name) || yoursKind.get(canonicalCardName(e.name)) || 'm');
+                k[kind] += e.count;
+            }
+            return k;
+        };
+        const ky = kindCounts(yours.main, true), kr = kindCounts(ref.zones.main, false);
+        const ratio = panel.createEl('div');
+        ratio.style.cssText = 'display: grid; grid-template-columns: 70px 1fr; gap: 4px 10px; align-items: center; font-family: monospace; font-size: 0.74em; margin-bottom: 10px;';
+        const bar = (label, k) => {
+            const total = k.m + k.s + k.t || 1;
+            ratio.createEl('div', { text: label }).style.cssText = 'color: #94a3b8;';
+            const wrap = ratio.createEl('div');
+            wrap.style.cssText = 'display: flex; height: 18px; border-radius: 4px; overflow: hidden; border: 1px solid #1f2937;';
+            for (const [key, color, nm] of [['m', '#f59e0b', 'Monsters'], ['s', '#22c55e', 'Spells'], ['t', '#a855f7', 'Traps']]) {
+                const seg = wrap.createEl('div', { text: k[key] ? `${nm[0]} ${k[key]} (${Math.round(100 * k[key] / total)}%)` : '' });
+                seg.style.cssText = `width: ${100 * k[key] / total}%; background: ${color}33; color: ${color}; text-align: center; line-height: 18px; white-space: nowrap; overflow: hidden;`;
+            }
+        };
+        bar('You', ky); bar('Reference', kr);
+
+        // Filter chips
+        const filters = panel.createEl('div');
+        filters.style.cssText = 'display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px;';
+        const FILTERS = [['all', 'all'], ['diff', 'different copies'], ['ref-only', 'only in reference'], ['yours-only', 'only in mine'], ['same', 'identical']];
+        for (const [key, label] of FILTERS) {
+            const on = this.compare.filter === key;
+            const b = this.mkBtn(filters, label, on ? '#60a5fa33' : '#1f2937', on ? '#60a5fa' : '#6b7280');
+            b.onclick = async () => { this.compare.filter = key; await this.render(); };
+        }
+
+        const table = panel.createEl('div');
+        table.style.cssText = 'display: grid; grid-template-columns: 1fr 70px 90px; gap: 2px 10px; font-family: monospace; font-size: 0.78em; max-height: 300px; overflow-y: auto;';
+        for (const t of ['Card', 'Yours', 'Reference']) table.createEl('div', { text: t }).style.cssText = 'color: #6b7280; font-weight: bold; padding-bottom: 4px; border-bottom: 1px solid #1f2937; position: sticky; top: 0; background: #0b1220;';
+        const COLORS = { same: '#6b7280', diff: '#facc15', 'ref-only': '#f87171', 'yours-only': '#60a5fa' };
+        const ICON = { same: '=', diff: '~', 'ref-only': '+', 'yours-only': '−' };
+        let lastZone = null, shown = 0;
+        for (const r of rows) {
+            if (this.compare.filter !== 'all' && r.status !== this.compare.filter) continue;
+            shown++;
+            if (r.zone !== lastZone) {
+                lastZone = r.zone;
+                table.createEl('div', { text: { main: mainLabel, extra: 'Extra Deck', side: 'Side Deck' }[r.zone] })
+                    .style.cssText = 'grid-column: 1 / -1; color: #a5b4fc; font-weight: bold; margin-top: 6px;';
+            }
+            const col = COLORS[r.status];
+            table.createEl('div', { text: `${ICON[r.status]} ${r.name}` }).style.cssText = `color: ${col};`;
+            table.createEl('div', { text: r.yours ? `×${r.yours}` : '—' }).style.cssText = `color: ${r.yours ? '#e2e8f0' : '#4b5563'};`;
+            const rc = table.createEl('div', { text: r.ref ? `×${r.ref}${r.status === 'diff' ? (r.ref > r.yours ? ' ▲' : ' ▼') : ''}` : '—' });
+            rc.style.cssText = `color: ${r.ref ? '#e2e8f0' : '#4b5563'};`;
+        }
+        if (!shown) table.createEl('div', { text: 'Nothing in this view.' }).style.cssText = 'grid-column: 1 / -1; color: #4b5563; padding: 10px 0;';
+        panel.createEl('div', { text: '▲/▼ = the reference runs more/fewer copies than you.' })
+            .style.cssText = 'font-family: monospace; font-size: 0.68em; color: #4b5563; margin-top: 6px;';
+    }
+
+    async renderHistory(body) {
+        const ref = this.refs.find(r => r.file.path === this.history.path);
+        if (!ref) { this.history = null; return; }
+        const revs = await this.plugin.listRefRevisions(ref.meta.name);
+        const panel = body.createEl('div');
+        panel.style.cssText = 'background: #0b1220; border: 1px solid #fbbf2466; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;';
+        const head = panel.createEl('div');
+        head.style.cssText = 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; font-family: monospace; font-size: 0.8em;';
+        head.createEl('span', { text: `📈 ${ref.meta.name} — rev ${ref.meta.revision} vs` }).style.cssText = 'color: #fbbf24; font-weight: bold;';
+        if (revs.length) {
+            const sel = head.createEl('select');
+            sel.style.cssText = 'background: #111827; color: #e2e8f0; border: 1px solid #374151; border-radius: 6px; padding: 4px 8px; font-family: monospace;';
+            revs.forEach((r, i) => { const o = sel.createEl('option', { text: `rev ${r.meta.revision} (${r.meta.imported ? new Date(r.meta.imported).toLocaleDateString() : '?'})` }); o.value = String(i); });
+            sel.value = String(Math.min(this.history.revIdx, revs.length - 1));
+            sel.onchange = async () => { this.history.revIdx = parseInt(sel.value, 10); await this.render(); };
+        }
+        const logBtn = this.mkBtn(head, '📜 Changelog', '#1f2937', '#fbbf24');
+        logBtn.onclick = async () => {
+            const f = this.app.vault.getAbstractFileByPath(`${this.plugin.getRefHistoryFolder(ref.meta.name)}/Changelog.md`);
+            if (!(f instanceof TFile)) { new Notice('No changelog yet.'); return; }
+            this.close(); await this.app.workspace.getLeaf(false).openFile(f);
+        };
+        const close = this.mkBtn(head, '✕ Close', '#1f2937', '#94a3b8');
+        close.style.marginLeft = 'auto';
+        close.onclick = async () => { this.history = null; await this.render(); };
+
+        if (!revs.length) {
+            panel.createEl('div', { text: 'No earlier revisions yet — update this reference later to start tracking changes.' })
+                .style.cssText = 'font-family: monospace; font-size: 0.78em; color: #94a3b8;';
+            return;
+        }
+        const old = revs[Math.min(this.history.revIdx, revs.length - 1)];
+        const rows = diffDeckContents(old.body, ref.body);
+        panel.createEl('div', { text: summarizeDiff(rows) }).style.cssText = 'font-family: monospace; font-size: 0.75em; color: #94a3b8; margin-bottom: 8px;';
+        if (rows.length) renderDiffTable(panel, rows, `rev ${old.meta.revision}`, `rev ${ref.meta.revision}`);
+    }
+}
+
 // Standalone collection browser: search/add cards, tabs by rarity, click a
 // tile to add a copy, ✕ to remove one — same interaction pattern as the
 // Deck Builder's card grid, but reading/writing the fixed collection note
@@ -4782,6 +5481,16 @@ class YugiohSettingTab extends PluginSettingTab {
             .addButton(btn => btn
                 .setButtonText('📂 Open Note')
                 .onClick(() => this.plugin.openCollectionNote())
+            );
+
+        containerEl.createEl('h3', { text: '🌐 Meta Deck Research' });
+        new Setting(containerEl)
+            .setName('Reference decks folder')
+            .setDesc('Where imported reference lists are saved as notes. Leave blank to use "Meta Decks" next to your Collection note.')
+            .addText(t => t
+                .setPlaceholder('Meta Decks')
+                .setValue(this.plugin.settings.metaDecksFolder || '')
+                .onChange(async (v) => { this.plugin.settings.metaDecksFolder = v; await this.plugin.saveSettings(); })
             );
 
         containerEl.createEl('h3', { text: '🗂️ Deck Archive' });
