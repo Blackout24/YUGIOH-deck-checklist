@@ -56,7 +56,7 @@ const BANLIST_SOURCE_URL = 'https://dawnbrandbots.github.io/yaml-yugi-limit-regu
 // offline stretch doesn't go unnoticed.
 const BANLIST_STALE_DAYS = 30;
 
-const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {}, autoSnapshots: true, metaDecksFolder: '', cardKindCache: {} };
+const DEFAULT_SETTINGS = { collectionNotePath: 'Yu-Gi-Oh Collection.md', roleOverrides: {}, autoSnapshots: true, metaDecksFolder: '', cardKindCache: {}, experiments: {} };
 
 // ── Shared line/section helpers ──────────────────────────────────────────────
 // Recognizes both checkbox styles: "- [ ]"/"- [x]" and "- ☐"/"- ☑".
@@ -1127,6 +1127,87 @@ function renderDiffTable(parent, rows, aLabel, bLabel) {
         table.createEl('div', { text: r.aCount ? `×${r.aCount}` : '—' }).style.cssText = `color: ${r.aCount ? '#e2e8f0' : '#4b5563'};`;
         table.createEl('div', { text: r.bCount ? `×${r.bCount}` : '—' }).style.cssText = `color: ${r.bCount ? '#e2e8f0' : '#4b5563'};`;
     }
+}
+
+// ── What-If Deck Builder ──────────────────────────────────────────────────
+// Experiments are lists of changes ({op:'remove'|'add', name, count, zone})
+// layered on top of the deck currently open in the builder. They live in
+// plugin data (settings.experiments[note path]) and are evaluated entirely
+// in memory — the deck note is only written when you click Apply.
+
+// P(at least one of K target copies appears in an h-card hand from N cards).
+function hypergeomAtLeastOne(N, K, h) {
+    if (K <= 0 || N <= 0) return 0;
+    if (h >= N) return 1;
+    let pNone = 1;
+    for (let i = 0; i < h; i++) {
+        const num = N - K - i;
+        if (num <= 0) return 1;
+        pNone *= num / (N - i);
+    }
+    return 1 - pNone;
+}
+
+function cloneZones(z) {
+    const c = (a) => (a || []).map(x => ({ ...x }));
+    return { main: c(z.main), extra: c(z.extra), side: c(z.side) };
+}
+
+// Applies changes to { main, extra, side } (arrays of card objects with .count).
+// `lookup` maps canonicalCardName → card object, used for cards being added.
+function applyExperimentChanges(base, changes, lookup) {
+    const z = cloneZones(base);
+    for (const ch of changes) {
+        const list = z[ch.zone];
+        if (!list) continue;
+        const key = canonicalCardName(ch.name);
+        const idx = list.findIndex(c => canonicalCardName(c.name) === key);
+        if (ch.op === 'remove') {
+            if (idx === -1) continue;
+            list[idx].count = (list[idx].count || 1) - ch.count;
+            if (list[idx].count <= 0) list.splice(idx, 1);
+        } else if (idx !== -1) {
+            list[idx].count = (list[idx].count || 1) + ch.count;
+        } else {
+            const card = lookup.get(key);
+            if (card) list.push({ ...card, count: ch.count });
+        }
+    }
+    return z;
+}
+
+// Which cards a combo line relies on. Matches known card names / nicknames
+// (the Combos tab's comboCardCache) inside each arrow-separated step, longest
+// match first, and keeps only cards that are in the original deck — so words
+// that fuzzy-matched some unrelated card don't count. Returns an array of
+// steps, each a Set of canonical card names.
+function resolveComboSteps(text, cache, deckNames) {
+    const STOP = new Set(['mill', 'draw', 'dump', 'loop', 'setup', 'route', 'line', 'board', 'break', 'up',
+        'negate', 'summon', 'timing', 'pop', 'extender', 'the', 'and', 'set', 'activate', 'discard', 'banish',
+        'tribute', 'flip', 'target', 'return', 'add', 'send', 'shuffle', 'reveal', 'destroy', 'special', 'normal']);
+    const keys = [...cache.keys()].filter(k => k.length >= 3 && !STOP.has(k)).sort((a, b) => b.length - a.length);
+    const steps = String(text || '').split(/→|->|➜|➔|⇒/).map(s => s.trim()).filter(Boolean);
+    return steps.map(step => {
+        const lower = step.toLowerCase();
+        const covered = new Array(lower.length).fill(false);
+        const found = new Set();
+        for (const key of keys) {
+            let from = 0, idx;
+            while ((idx = lower.indexOf(key, from)) !== -1) {
+                from = idx + key.length;
+                const okL = idx === 0 || !/[a-z0-9]/.test(lower[idx - 1]);
+                const okR = from >= lower.length || !/[a-z0-9]/.test(lower[from]);
+                if (!okL || !okR || covered.slice(idx, from).some(Boolean)) continue;
+                const card = cache.get(key);
+                const canon = card ? canonicalCardName(card.name) : null;
+                if (canon && deckNames.has(canon)) {
+                    found.add(canon);
+                    for (let i = idx; i < from; i++) covered[i] = true;
+                }
+            }
+        }
+        return found;
+    });
 }
 
 class YugiohPlugin extends Plugin {
@@ -2203,6 +2284,8 @@ class DeckUI extends Modal {
         versionsBtn.title = 'Save, compare and restore named versions of this deck note';
         const researchBtn = this.makeBtn(searchRow, '🌐 Meta Research', '#0c4a6e', '#bae6fd');
         researchBtn.title = 'Import public deck lists and compare them with your deck';
+        const whatIfBtn = this.makeBtn(searchRow, '🧪 What-If', '#581c87', '#e9d5ff');
+        whatIfBtn.title = 'Try changes on a copy of the deck and compare results — the original is never touched until you apply';
         const applyTplBtn = this.makeBtn(searchRow, '🗋 Apply Template', '#1f2937', '#f87171');
         applyTplBtn.title = 'Overwrite the current note with the blank deck template';
 
@@ -2305,6 +2388,7 @@ class DeckUI extends Modal {
         craftBtn.onclick = () => this.showCraftList();
         versionsBtn.onclick = () => this.openVersions();
         researchBtn.onclick = () => new ResearchUI(this.app, this.plugin, this).open();
+        whatIfBtn.onclick = () => new WhatIfUI(this.app, this.plugin, this).open();
         applyTplBtn.onclick = () => this.confirmApplyTemplate();
 
         // Auto-load on open
@@ -3966,11 +4050,13 @@ class DeckUI extends Modal {
     // back to Main 60, even right after viewing the 40-Card Variant tab.
     // Copy limits are checked against main+extra+side combined, since a real
     // Master Duel/TCG copy limit spans all three zones together.
-    validateDeck() {
+    // `override` ({ main, extra, side } card arrays) validates a hypothetical
+    // deck (used by the What-If builder) instead of the loaded one.
+    validateDeck(override) {
         const mainKey = this.lastMainDeckTab;
-        const mainCards = this.decks[mainKey];
-        const extraCards = this.decks.extra;
-        const sideCards = this.decks.side || [];
+        const mainCards = override ? override.main : this.decks[mainKey];
+        const extraCards = override ? override.extra : this.decks.extra;
+        const sideCards = override ? (override.side || []) : (this.decks.side || []);
 
         const sumCopies = cards => cards.reduce((n, c) => n + (c.count || 1), 0);
         const mainCount = sumCopies(mainCards);
@@ -5102,6 +5188,456 @@ class ResearchUI extends Modal {
         const rows = diffDeckContents(old.body, ref.body);
         panel.createEl('div', { text: summarizeDiff(rows) }).style.cssText = 'font-family: monospace; font-size: 0.75em; color: #94a3b8; margin-bottom: 8px;';
         if (rows.length) renderDiffTable(panel, rows, `rev ${old.meta.revision}`, `rev ${ref.meta.revision}`);
+    }
+}
+
+// What-If Deck Builder window. Experiments are changes layered on the deck
+// open in the builder (Main/40-card + Extra + Side); the original is only
+// written if you press Apply (after an automatic snapshot).
+class WhatIfUI extends Modal {
+    constructor(app, plugin, deckUI) {
+        super(app);
+        this.plugin = plugin;
+        this.deckUI = deckUI;
+        this.file = plugin.getActiveFile();
+        this.handSize = 5;
+        this.trials = 10000;
+        this.lookup = new Map();   // canonical name → card object (for added cards)
+        this.results = null;
+        this.stale = false;
+        this.busy = false;
+        this.status = '';
+        this.drafts = {};          // per-experiment add-change form state
+        this.comboSpecs = null;
+        const all = plugin.settings.experiments = plugin.settings.experiments || {};
+        this.key = this.file ? this.file.path : '';
+        this.experiments = all[this.key] = all[this.key] || [];
+    }
+
+    // ── baseline ─────────────────────────────────────────────────────────
+    mainKey() { return this.deckUI.lastMainDeckTab; }
+    baseZones() {
+        const d = this.deckUI.decks;
+        return cloneZones({ main: d[this.mainKey()], extra: d.extra, side: d.side });
+    }
+    zonesFor(exp) {
+        for (const c of [...this.baseZones().main, ...this.baseZones().extra, ...this.baseZones().side]) this.lookup.set(canonicalCardName(c.name), c);
+        return applyExperimentChanges(this.baseZones(), exp ? exp.changes : [], this.lookup);
+    }
+    total(list) { return list.reduce((n, c) => n + (c.count || 1), 0); }
+    async persist() { await this.plugin.saveSettings(); }
+    uid() { return 'x' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36); }
+
+    async onOpen() {
+        if (!this.file) { new Notice(' No note is currently open. Open your deck note first.'); this.close(); return; }
+        this.modalEl.style.width = '1100px';
+        this.modalEl.style.maxWidth = '96vw';
+        this.modalEl.style.maxHeight = '92vh';
+        const { contentEl } = this;
+        contentEl.style.cssText = `background: #0d0f1a; color: #e2e8f0; font-family: 'Georgia', serif; padding: 0; display: flex; flex-direction: column; height: 85vh;`;
+        const header = contentEl.createEl('div');
+        header.style.cssText = `background: linear-gradient(135deg, #1a0a2e 0%, #16213e 50%, #0f3460 100%); padding: 16px 24px 12px; border-bottom: 2px solid #c084fc44; flex-shrink: 0;`;
+        const title = header.createEl('h1');
+        title.textContent = '🧪 What-If Deck Builder';
+        title.style.cssText = `margin: 0 0 3px; font-size: 1.35em; font-weight: bold; background: linear-gradient(90deg, #c084fc, #f0abfc); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;`;
+        const sub = header.createEl('p');
+        sub.style.cssText = 'margin: 0; font-size: 0.72em; color: #94a3b8; font-family: monospace;';
+        sub.textContent = '🔒 Your original deck is never touched unless you press Apply on an experiment (a snapshot is taken first).';
+        this.body = contentEl.createEl('div');
+        this.body.style.cssText = 'padding: 14px 22px 20px; overflow-y: auto; flex: 1;';
+        this.render();
+    }
+
+    mkBtn(parent, label, bg, color, title) {
+        const b = parent.createEl('button');
+        b.textContent = label;
+        if (title) b.title = title;
+        b.style.cssText = `background: ${bg}; color: ${color}; border: 1px solid ${color}55; padding: 5px 11px; border-radius: 6px; cursor: pointer; font-size: 0.78em; font-family: monospace; font-weight: bold;`;
+        return b;
+    }
+
+    setStatus(msg) { this.status = msg; if (this.statusEl) this.statusEl.textContent = msg; }
+
+    // ── editing experiments ──────────────────────────────────────────────
+    newExperiment() {
+        const n = this.experiments.length;
+        this.experiments.push({ id: this.uid(), name: `Experiment ${String.fromCharCode(65 + (n % 26))}${n >= 26 ? Math.floor(n / 26) : ''}`, changes: [] });
+        this.stale = !!this.results;
+        this.persist(); this.render();
+    }
+
+    async addChange(exp, op, rawName, rawCount, zone) {
+        const name = rawName.trim();
+        if (!name) { new Notice('Type a card name first.'); return; }
+        let count = Math.max(1, parseInt(rawCount, 10) || 1);
+        const current = this.zonesFor(exp);
+        if (op === 'remove') {
+            const key = canonicalCardName(name);
+            const hit = current[zone].find(c => canonicalCardName(c.name) === key);
+            if (!hit) { new Notice(`"${name}" isn't in this experiment's ${zone} deck.`); return; }
+            if (count > (hit.count || 1)) { count = hit.count || 1; new Notice(`Only ${count} cop${count === 1 ? 'y' : 'ies'} left — clamped.`); }
+            exp.changes.push({ op, name: hit.name, count, zone });
+        } else {
+            let card = this.lookup.get(canonicalCardName(name));
+            if (!card) {
+                this.setStatus(`Looking up "${name}"…`);
+                card = await this.plugin.fetchCard(name);
+                this.setStatus('');
+                if (!card) { new Notice(`Couldn't find a card named "${name}".`); return; }
+                this.lookup.set(canonicalCardName(card.name), card);
+            }
+            const z = (zone === 'main' && isExtraDeckType(card.type)) ? 'extra' : zone;
+            exp.changes.push({ op, name: card.name, count, zone: z });
+        }
+        this.stale = !!this.results;
+        await this.persist();
+        this.render();
+    }
+
+    // ── metrics ──────────────────────────────────────────────────────────
+    craftReport(zones) {
+        const cm = this.deckUI.collectionMap;
+        if (!cm || cm.size === 0) return null;
+        const needed = new Map();
+        for (const c of [...zones.main, ...zones.extra]) {
+            const prev = needed.get(c.name);
+            needed.set(c.name, { need: (prev ? prev.need : 0) + (c.count || 1), rarity: c.rarity });
+        }
+        const byRarity = { UR: 0, SR: 0, R: 0, N: 0 };
+        const missing = [];
+        let total = 0;
+        for (const [name, { need, rarity }] of needed) {
+            const have = (cm.get(name.toLowerCase()) || {}).count || 0;
+            const short = need - have;
+            if (short > 0) { missing.push({ name, rarity, short }); byRarity[rarity in byRarity ? rarity : 'N'] += short; total += short; }
+        }
+        return { byRarity, missing, total };
+    }
+
+    async prepareCombos() {
+        const du = this.deckUI;
+        if (!du.combos || du.combos.length === 0) { this.comboSpecs = []; return; }
+        this.setStatus('Resolving combo cards…');
+        try { await du.prefetchComboCards(); } catch (err) { console.error(err); }
+        const base = this.baseZones();
+        const deckNames = new Set([...base.main, ...base.extra].map(c => canonicalCardName(c.name)));
+        const cache = new Map([...du.comboCardCache].map(([k, v]) => [k, v]));
+        this.comboSpecs = du.combos.map(c => ({ text: c.text, category: c.category, steps: resolveComboSteps(c.text, cache, deckNames) }))
+            .filter(s => s.steps.some(st => st.size > 0));
+    }
+
+    comboResults(zones, poolSize) {
+        const have = new Map();
+        for (const c of [...zones.main, ...zones.extra]) have.set(canonicalCardName(c.name), (have.get(canonicalCardName(c.name)) || 0) + (c.count || 1));
+        const mainCopies = (name) => zones.main.filter(c => canonicalCardName(c.name) === name).reduce((n, c) => n + (c.count || 1), 0);
+        return this.comboSpecs.map(spec => {
+            const all = new Set(spec.steps.flatMap(s => [...s]));
+            const missing = [...all].filter(n => !have.has(n));
+            const first = spec.steps.find(s => s.size > 0) || new Set();
+            const K = [...first].reduce((n, name) => n + mainCopies(name), 0);
+            return { text: spec.text, intact: missing.length === 0, missing, openPct: first.size && poolSize >= this.handSize ? 100 * hypergeomAtLeastOne(poolSize, K, this.handSize) : null };
+        });
+    }
+
+    metricsFor(label, zones) {
+        const du = this.deckUI;
+        const pool = [];
+        for (const c of zones.main) for (let i = 0; i < (c.count || 1); i++) pool.push(c);
+        const test = pool.length >= this.handSize ? du.runConsistencyTest(pool, this.handSize, this.trials) : null;
+        const roleCopies = { starter: 0, handtrap: 0, brick: 0 };
+        for (const c of zones.main) {
+            const r = du.getCardRole(c).role;
+            const n = c.count || 1;
+            if (r === 'starter' || r === 'searcher') roleCopies.starter += n;
+            else if (r === 'handtrap') roleCopies.handtrap += n;
+            else if (r === 'brick') roleCopies.brick += n;
+        }
+        const val = du.validateDeck(zones);
+        return {
+            label, size: pool.length, test, roleCopies,
+            craft: this.craftReport(zones),
+            errors: val.errors, warnings: val.warnings,
+            combos: this.comboSpecs ? this.comboResults(zones, pool.length) : [],
+        };
+    }
+
+    async runAll() {
+        if (this.busy) return;
+        this.busy = true;
+        try {
+            // Make sure every card an experiment adds has a card object.
+            for (const exp of this.experiments) for (const ch of exp.changes) {
+                if (ch.op !== 'add') continue;
+                const key = canonicalCardName(ch.name);
+                if (!this.lookup.has(key)) {
+                    this.setStatus(`Looking up "${ch.name}"…`);
+                    const card = await this.plugin.fetchCard(ch.name);
+                    if (card) this.lookup.set(key, card);
+                }
+            }
+            await this.prepareCombos();
+            const variants = [{ label: 'Original', exp: null }, ...this.experiments.map(e => ({ label: e.name, exp: e }))];
+            const out = [];
+            for (let i = 0; i < variants.length; i++) {
+                this.setStatus(`Simulating ${variants[i].label} (${i + 1}/${variants.length})…`);
+                await new Promise(r => setTimeout(r, 20));
+                out.push(this.metricsFor(variants[i].label, this.zonesFor(variants[i].exp)));
+            }
+            this.results = { variants: out, handSize: this.handSize, trials: this.trials, mainLabel: this.mainKey() === 'main40' ? '40-Card Variant' : 'Main Deck' };
+            this.stale = false;
+            this.setStatus('');
+        } catch (err) {
+            console.error('[YugiohPlugin] what-if run failed:', err);
+            new Notice(`What-if run failed: ${err.message}`);
+        }
+        this.busy = false;
+        this.render();
+    }
+
+    // ── apply (the only code path that writes the note) ──────────────────
+    async applyExperiment(exp) {
+        const du = this.deckUI;
+        try {
+            await this.plugin.autoSnapshot(this.file, `Before applying experiment "${exp.name}"`, true);
+            let content = await this.plugin.readTemplate();
+            if (!content) throw new Error('could not read the deck note');
+            const groupOf = { main: this.mainKey(), extra: 'extra', side: 'side' };
+            for (const ch of exp.changes) {
+                const group = groupOf[ch.zone];
+                if (ch.op === 'remove') {
+                    for (let i = 0; i < ch.count; i++) {
+                        const r = decrementCardInTemplate(content, ch.name, group);
+                        if (r.found === false) break;
+                        content = r.content;
+                    }
+                } else {
+                    const key = canonicalCardName(ch.name);
+                    let card = this.lookup.get(key) || await this.plugin.fetchCard(ch.name);
+                    if (!card) throw new Error(`couldn't load "${ch.name}"`);
+                    const hit = parseCardsFromMarkdown(content).find(e => e.deckGroup === group && canonicalCardName(e.name) === key);
+                    content = upsertCardInTemplate(content, { ...card, deckGroup: group, count: (hit ? hit.count : 0) + ch.count });
+                }
+            }
+            if (!(await this.plugin.writeTemplate(content))) throw new Error('write failed');
+            this.experiments.splice(this.experiments.indexOf(exp), 1);
+            await this.persist();
+            await du.loadFromTemplate();
+            this.results = null;
+            new Notice(`🧪 Applied "${exp.name}" to the deck. A snapshot was taken first — restore it from 🗂️ Versions to undo.`, 8000);
+            this.render();
+        } catch (err) {
+            console.error('[YugiohPlugin] apply failed:', err);
+            new Notice(`Apply failed: ${err.message}`);
+        }
+    }
+
+    // ── rendering ────────────────────────────────────────────────────────
+    render() {
+        const body = this.body;
+        body.empty();
+        const inputCss = 'background: #111827; color: #e2e8f0; border: 1px solid #374151; border-radius: 6px; padding: 5px 8px; font-family: monospace; font-size: 0.8em; box-sizing: border-box;';
+
+        // Original summary
+        const base = this.baseZones();
+        const orig = body.createEl('div');
+        orig.style.cssText = 'background: #111827; border: 1px solid #4ade8066; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; font-family: monospace; font-size: 0.8em;';
+        orig.createEl('div', { text: `🔒 ORIGINAL — ${this.file.basename}` }).style.cssText = 'color: #4ade80; font-weight: bold;';
+        orig.createEl('div', { text: `${this.mainKey() === 'main40' ? '40-Card Variant' : 'Main Deck'}: ${this.total(base.main)} · Extra: ${this.total(base.extra)} · Side: ${this.total(base.side)}   (switch the builder's Main/40-Card tab to experiment on the other build)` })
+            .style.cssText = 'color: #94a3b8; margin-top: 3px;';
+
+        // Experiments
+        const dl = body.createEl('datalist');
+        dl.id = 'whatif-cards';
+        const names = [...new Set([...base.main, ...base.extra, ...base.side].map(c => c.name))].sort();
+        for (const n of names) dl.createEl('option').value = n;
+
+        for (const exp of this.experiments) this.renderExperiment(body, exp, inputCss);
+
+        const controls = body.createEl('div');
+        controls.style.cssText = 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 12px 0;';
+        const newBtn = this.mkBtn(controls, '＋ New experiment', '#1f2937', '#c084fc');
+        newBtn.onclick = () => this.newExperiment();
+        const hs = controls.createEl('select');
+        hs.style.cssText = inputCss;
+        for (const n of [5, 6]) { const o = hs.createEl('option', { text: `${n}-card hands` }); o.value = String(n); }
+        hs.value = String(this.handSize);
+        hs.onchange = () => { this.handSize = parseInt(hs.value, 10); this.stale = !!this.results; this.render(); };
+        const runBtn = this.mkBtn(controls, '▶ Run & compare', '#c084fc', '#0d0f1a', `Simulates ${this.trials.toLocaleString()} hands per version`);
+        runBtn.onclick = () => this.runAll();
+        this.statusEl = controls.createEl('span', { text: this.status });
+        this.statusEl.style.cssText = 'font-family: monospace; font-size: 0.75em; color: #94a3b8;';
+
+        if (this.results) this.renderResults(body);
+        else if (!this.experiments.length) {
+            body.createEl('div', { text: 'Create an experiment, add some − / + changes, then Run & compare. You can compare as many experiments side by side as you like.' })
+                .style.cssText = 'color: #4b5563; font-family: monospace; font-size: 0.82em; padding: 18px; text-align: center;';
+        }
+    }
+
+    renderExperiment(body, exp, inputCss) {
+        const card = body.createEl('div');
+        card.style.cssText = 'background: #111827; border: 1px solid #c084fc55; border-radius: 8px; padding: 10px 14px; margin-bottom: 10px;';
+
+        const top = card.createEl('div');
+        top.style.cssText = 'display: flex; gap: 8px; align-items: center; flex-wrap: wrap;';
+        const nameIn = top.createEl('input');
+        nameIn.value = exp.name; nameIn.style.cssText = inputCss + ' font-weight: bold; width: 220px;';
+        nameIn.onchange = () => { exp.name = nameIn.value.trim() || exp.name; this.stale = !!this.results; this.persist(); };
+        const minus = exp.changes.filter(c => c.op === 'remove').reduce((n, c) => n + c.count, 0);
+        const plus = exp.changes.filter(c => c.op === 'add').reduce((n, c) => n + c.count, 0);
+        top.createEl('span', { text: `− ${minus}   + ${plus}` }).style.cssText = 'font-family: monospace; font-size: 0.78em; color: #94a3b8;';
+
+        const right = top.createEl('div');
+        right.style.cssText = 'margin-left: auto; display: flex; gap: 6px;';
+        const dup = this.mkBtn(right, '📋 Duplicate', '#1f2937', '#94a3b8');
+        dup.onclick = () => {
+            this.experiments.push({ id: this.uid(), name: `${exp.name} (copy)`, changes: exp.changes.map(c => ({ ...c })) });
+            this.stale = !!this.results; this.persist(); this.render();
+        };
+        const apply = this.mkBtn(right, '✅ Apply to deck', '#1f2937', '#4ade80', 'Writes these changes into the real deck note (snapshot first)');
+        let armedA = false;
+        apply.onclick = () => {
+            if (!exp.changes.length) { new Notice('This experiment has no changes.'); return; }
+            if (!armedA) {
+                armedA = true; apply.textContent = '❗ Overwrite the real deck?';
+                setTimeout(() => { armedA = false; apply.textContent = '✅ Apply to deck'; }, 3500);
+                return;
+            }
+            this.applyExperiment(exp);
+        };
+        const del = this.mkBtn(right, '🗑️', '#1f2937', '#f87171', 'Delete this experiment (the deck is not affected)');
+        let armedD = false;
+        del.onclick = () => {
+            if (!armedD) { armedD = true; del.textContent = '❗'; setTimeout(() => { armedD = false; del.textContent = '🗑️'; }, 2500); return; }
+            this.experiments.splice(this.experiments.indexOf(exp), 1);
+            this.stale = !!this.results; this.persist(); this.render();
+        };
+
+        const chips = card.createEl('div');
+        chips.style.cssText = 'display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0;';
+        if (!exp.changes.length) chips.createEl('span', { text: 'No changes yet — identical to the original.' }).style.cssText = 'font-family: monospace; font-size: 0.75em; color: #4b5563;';
+        exp.changes.forEach((ch, i) => {
+            const color = ch.op === 'remove' ? '#f87171' : '#4ade80';
+            const chip = chips.createEl('span');
+            chip.style.cssText = `font-family: monospace; font-size: 0.75em; padding: 2px 4px 2px 9px; border-radius: 12px; color: ${color}; border: 1px solid ${color}66; background: ${color}14; display: inline-flex; gap: 6px; align-items: center;`;
+            chip.createEl('span', { text: `${ch.op === 'remove' ? '−' : '+'} ${ch.name} ×${ch.count} (${ch.zone})` });
+            const x = chip.createEl('span', { text: '✕' });
+            x.style.cssText = 'cursor: pointer; padding: 0 5px; opacity: .7;';
+            x.onclick = () => { exp.changes.splice(i, 1); this.stale = !!this.results; this.persist(); this.render(); };
+        });
+
+        const d = this.drafts[exp.id] = this.drafts[exp.id] || { op: 'remove', name: '', count: '1', zone: 'main' };
+        const row = card.createEl('div');
+        row.style.cssText = 'display: flex; gap: 6px; flex-wrap: wrap; align-items: center;';
+        const op = row.createEl('select'); op.style.cssText = inputCss;
+        for (const [v, t] of [['remove', '− Remove'], ['add', '+ Add']]) { const o = op.createEl('option', { text: t }); o.value = v; }
+        op.value = d.op; op.onchange = () => { d.op = op.value; };
+        const nm = row.createEl('input'); nm.placeholder = 'Card name'; nm.value = d.name; nm.style.cssText = inputCss + ' width: 240px;';
+        nm.setAttribute('list', 'whatif-cards'); nm.oninput = () => { d.name = nm.value; };
+        const ct = row.createEl('input'); ct.type = 'number'; ct.min = '1'; ct.max = '3'; ct.value = d.count; ct.style.cssText = inputCss + ' width: 56px;';
+        ct.oninput = () => { d.count = ct.value; };
+        const zn = row.createEl('select'); zn.style.cssText = inputCss;
+        for (const z of ['main', 'extra', 'side']) { const o = zn.createEl('option', { text: z }); o.value = z; }
+        zn.value = d.zone; zn.onchange = () => { d.zone = zn.value; };
+        const add = this.mkBtn(row, 'Add change', '#c084fc', '#0d0f1a');
+        const submit = async () => { await this.addChange(exp, d.op, d.name, d.count, d.zone); d.name = ''; this.render(); };
+        add.onclick = submit;
+        nm.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+    }
+
+    renderResults(body) {
+        const R = this.results;
+        const V = R.variants;
+        const wrap = body.createEl('div');
+        wrap.style.cssText = 'background: #0b1220; border: 1px solid #1f2937; border-radius: 8px; padding: 12px 14px; overflow-x: auto;';
+        const head = wrap.createEl('div');
+        head.style.cssText = 'font-family: monospace; font-size: 0.78em; color: #94a3b8; margin-bottom: 8px;';
+        head.textContent = `${R.trials.toLocaleString()} simulated ${R.handSize}-card hands per version · ${R.mainLabel} only (Side not drawn) · deltas are vs Original`;
+        if (this.stale) {
+            const warn = wrap.createEl('div', { text: '⚠️ Experiments changed since this run — press Run & compare to refresh.' });
+            warn.style.cssText = 'font-family: monospace; font-size: 0.75em; color: #facc15; margin-bottom: 8px;';
+        }
+
+        const table = wrap.createEl('div');
+        table.style.cssText = `display: grid; grid-template-columns: 190px repeat(${V.length}, minmax(130px, 1fr)); gap: 3px 10px; font-family: monospace; font-size: 0.78em; align-items: start;`;
+        const cell = (text, css = '', title = '') => { const c = table.createEl('div', { text }); c.style.cssText = css; if (title) c.title = title; return c; };
+        cell('', 'border-bottom: 1px solid #1f2937;');
+        V.forEach((v, i) => cell(i === 0 ? '🔒 Original' : v.label, `font-weight: bold; color: ${i === 0 ? '#4ade80' : '#c084fc'}; border-bottom: 1px solid #1f2937; padding-bottom: 4px;`));
+
+        const section = (t) => { const c = cell(t, 'grid-column: 1 / -1; color: #a5b4fc; font-weight: bold; margin-top: 8px;'); return c; };
+        // good: 'up' | 'down' | null  — which direction is an improvement
+        const numRow = (label, get, fmt, good, unit = '') => {
+            cell(label, 'color: #cbd5e1;');
+            const baseVal = get(V[0]);
+            V.forEach((v, i) => {
+                const val = get(v);
+                if (val === null || val === undefined) { cell('—', 'color: #4b5563;'); return; }
+                const c = cell(`${fmt(val)}${unit}`, 'color: #e2e8f0;');
+                if (i > 0 && baseVal !== null && baseVal !== undefined) {
+                    const d = val - baseVal;
+                    if (Math.abs(d) >= 0.05) {
+                        const better = good ? ((good === 'up') === (d > 0)) : null;
+                        const span = c.createEl('span', { text: `  ${d > 0 ? '+' : ''}${fmt(d)}${unit}` });
+                        span.style.cssText = `font-size: 0.9em; color: ${better === null ? '#60a5fa' : better ? '#4ade80' : '#f87171'};`;
+                    }
+                }
+            });
+        };
+        const pct = (x) => x.toFixed(1);
+        const int = (x) => String(Math.round(x));
+
+        section('Opening hand odds');
+        numRow('Starter in hand', v => v.test ? v.test.starterPct : null, pct, 'up', '%');
+        numRow('Extender in hand', v => v.test ? v.test.extenderPct : null, pct, 'up', '%');
+        numRow('Hand trap in hand', v => v.test ? v.test.handtrapPct : null, pct, null, '%');
+        numRow('Playable hand', v => v.test ? v.test.playablePct : null, pct, 'up', '%');
+        numRow('Dead hand (brick)', v => v.test ? v.test.brickPct : null, pct, 'down', '%');
+        numRow('Avg starters / hand', v => v.test ? v.test.avgStarters : null, (x) => x.toFixed(2), 'up');
+
+        section('Deck composition');
+        numRow(`${R.mainLabel} size`, v => v.size, int, null);
+        numRow('Starter copies', v => v.roleCopies.starter, int, 'up');
+        numRow('Hand-trap copies', v => v.roleCopies.handtrap, int, null);
+        numRow('Hand-trap density', v => v.size ? 100 * v.roleCopies.handtrap / v.size : null, pct, null, '%');
+        numRow('Potential brick copies', v => v.roleCopies.brick, int, 'down');
+
+        section('Crafting (Main + Extra vs your Collection)');
+        if (V.every(v => v.craft === null)) {
+            cell('No Collection note loaded — set one up to see craft needs.', 'grid-column: 1 / -1; color: #6b7280;');
+        } else {
+            numRow('Copies still to craft', v => v.craft ? v.craft.total : null, int, 'down');
+            cell('  by rarity', 'color: #6b7280;');
+            V.forEach(v => cell(v.craft ? `UR ${v.craft.byRarity.UR} · SR ${v.craft.byRarity.SR} · R ${v.craft.byRarity.R} · N ${v.craft.byRarity.N}` : '—', 'color: #94a3b8;'));
+            cell('  UR points (30 each)', 'color: #6b7280;');
+            V.forEach(v => cell(v.craft ? String(30 * v.craft.byRarity.UR) : '—', 'color: #94a3b8;'));
+        }
+
+        section('Legality');
+        cell('Master Duel banlist & sizes', 'color: #cbd5e1;');
+        V.forEach(v => {
+            const ok = v.errors.length === 0;
+            cell(ok ? `✅ legal${v.warnings.length ? ` (${v.warnings.length} limited)` : ''}` : `❌ ${v.errors.length} problem${v.errors.length === 1 ? '' : 's'}: ${v.errors[0]}`,
+                `color: ${ok ? '#4ade80' : '#f87171'};`, [...v.errors, ...v.warnings].join('\n'));
+        });
+
+        section('Your combo tests');
+        if (!this.comboSpecs || this.comboSpecs.length === 0) {
+            cell('No combos in the note could be matched to cards in this deck. Add lines under a 🧠 COMBO CHECKLIST section.', 'grid-column: 1 / -1; color: #6b7280;');
+        } else {
+            cell('Combos intact', 'color: #cbd5e1;');
+            V.forEach(v => { const n = v.combos.filter(c => c.intact).length; cell(`${n} / ${v.combos.length}`, `color: ${n === v.combos.length ? '#4ade80' : '#facc15'};`); });
+            this.comboSpecs.forEach((spec, ci) => {
+                cell(spec.text.length > 44 ? spec.text.slice(0, 43) + '…' : spec.text, 'color: #94a3b8;', spec.text);
+                V.forEach(v => {
+                    const r = v.combos[ci];
+                    if (!r) { cell('—', 'color: #4b5563;'); return; }
+                    if (!r.intact) cell(`❌ missing ${r.missing.map(n => n.replace(/\b\w/g, ch => ch.toUpperCase())).join(', ')}`, 'color: #f87171;');
+                    else cell(r.openPct === null ? '✅ intact' : `✅ opens ${r.openPct.toFixed(0)}%`, 'color: #4ade80;', 'Chance the first step\'s card(s) are in the opening hand');
+                });
+            });
+            wrap.createEl('div', { text: 'Combo cards are matched from the combo text to cards in your original deck (approximate). "opens x%" = chance your opening hand contains the first step\'s card(s).' })
+                .style.cssText = 'font-family: monospace; font-size: 0.68em; color: #4b5563; margin-top: 8px;';
+        }
     }
 }
 
